@@ -37,6 +37,9 @@ param(
   [int]$Duration
 )
 
+# Version variable – change this in one place, it updates the banner automatically
+$Script:WifiMonitorVersion = '1.666'
+
 # --- Default parameter values (PowerShell 5-safe) ---
 if (-not $PSBoundParameters.ContainsKey('Interval') -or $Interval -le 0) {
   $Interval = 5
@@ -285,7 +288,7 @@ $lastTx = $null
 $lastTS = Get-Date
 $startTime = Get-Date
 
-Write-Host "Starting Wi-Fi monitor v1.666 (FINAL). Press Ctrl-C to stop.`n" -ForegroundColor Green
+Write-Host ("Starting Wi-Fi monitor v{0}. Press Ctrl-C to stop.`n" -f $Script:WifiMonitorVersion) -ForegroundColor Green
 
 while ($true) {
   try {
@@ -340,7 +343,8 @@ while ($true) {
     # -------------------- HEADER --------------------
     $timePart = "{0:yyyy-MM-dd HH:mm:ss}" -f $now
 
-    Write-Host "Wi-Fi Monitor v1.666 (FINAL) |  $timePart  |  Adapter: " -ForegroundColor Green -NoNewline
+    $headerTitle = "Wi-Fi Monitor v{0}" -f $Script:WifiMonitorVersion
+    Write-Host ("{0} |  {1}  |  Adapter: " -f $headerTitle, $timePart) -ForegroundColor Green -NoNewline
     Write-Host $info.Name -ForegroundColor Yellow -NoNewline
     if ($info.Description) { Write-Host " ($($info.Description))" -ForegroundColor Yellow } else { Write-Host "" }
 
@@ -393,7 +397,7 @@ while ($true) {
     Write-Host ("{0,-12}: " -f "Link rate") -ForegroundColor DarkGray -NoNewline
     Write-Host ("{0} Mbps (rx) | {1} Mbps (tx)" -f $rxText, $txText) -ForegroundColor White
 
-    # --- final version signal line (brackets white, inside colored) ---
+    # --- signal line: brackets white, inside colored ---
     Write-Host ("{0,-12}: " -f "Signal") -ForegroundColor DarkGray -NoNewline
     Write-Host (" {0} " -f $sigText) -ForegroundColor $sigColor -NoNewline
     Write-Host "[" -ForegroundColor White -NoNewline
