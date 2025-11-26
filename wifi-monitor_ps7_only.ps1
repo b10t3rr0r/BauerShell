@@ -1,6 +1,9 @@
 <#
   Wi-Fi Monitor v1.666
   ------------------------------------
+  Copyright (c) 2025 Benny Hult
+  Licensed under the BSD 3-Clause License. See LICENSE file in the project root for details.
+  
   A lightweight, netsh-based Wi-Fi monitor for PowerShell 7.
 
   Features
