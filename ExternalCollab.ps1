@@ -82,6 +82,11 @@ AddDomain, AddEntra, AddSPO, AddTeams, RemoveEntra, RemoveSPO, RemoveTeams, and 
 comma-separated list, for example -AddDomain fabrikam.com,northwind.com. Domains are normalized to lower
 case and de-duplicated. Any invalid domain rejects the whole batch before authentication.
 
+PurgeGuests accepts a comma-separated list of selectors in the same way, mixing exact addresses and
+domain wildcards freely, for example -PurgeGuests user@fabrikam.com,*@northwind.com. Overlapping
+selectors are de-duplicated by object id, so an account matched by several selectors is previewed and
+deleted exactly once. A selector that matches nothing is reported and the remaining ones still run.
+
 .PARAMETER SyncDrifted
 Synchronizes Entra ID / SharePoint DRIFT domains that already have one or more guest accounts.
 Teams remains audit-only for this batch operation.
@@ -143,58 +148,61 @@ verification, purge safety output, and rollback details always remain visible.
 Disables ANSI/Nord console coloring.
 
 .EXAMPLE
-.\ExternalCollab.ps1 -Audit -SharePointAdminUrl "https://contoso-admin.sharepoint.com"
+.\ExternalCollab-DenimDemon-22b555.ps1 -Audit -SharePointAdminUrl "https://contoso-admin.sharepoint.com"
 
 .EXAMPLE
-.\ExternalCollab.ps1 -AddDomain fabrikam.com -WhatIf -SharePointAdminUrl "https://contoso-admin.sharepoint.com"
+.\ExternalCollab-DenimDemon-22b555.ps1 -AddDomain fabrikam.com -WhatIf -SharePointAdminUrl "https://contoso-admin.sharepoint.com"
 
 .EXAMPLE
-.\ExternalCollab.ps1 -AddDomain fabrikam.com,northwind.com -WhatIf -SharePointAdminUrl "https://contoso-admin.sharepoint.com"
+.\ExternalCollab-DenimDemon-22b555.ps1 -AddDomain fabrikam.com,northwind.com -WhatIf -SharePointAdminUrl "https://contoso-admin.sharepoint.com"
 
 .EXAMPLE
-.\ExternalCollab.ps1 -AddDomain fabrikam.com -SharePointAdminUrl "https://contoso-admin.sharepoint.com"
+.\ExternalCollab-DenimDemon-22b555.ps1 -AddDomain fabrikam.com -SharePointAdminUrl "https://contoso-admin.sharepoint.com"
 
 .EXAMPLE
-.\ExternalCollab.ps1 -PurgeDomain fabrikam.com -WhatIf -SharePointAdminUrl "https://contoso-admin.sharepoint.com"
+.\ExternalCollab-DenimDemon-22b555.ps1 -PurgeDomain fabrikam.com -WhatIf -SharePointAdminUrl "https://contoso-admin.sharepoint.com"
 
 .EXAMPLE
-.\ExternalCollab.ps1 -PurgeDomain fabrikam.com,northwind.com -WhatIf -SharePointAdminUrl "https://contoso-admin.sharepoint.com"
+.\ExternalCollab-DenimDemon-22b555.ps1 -PurgeDomain fabrikam.com,northwind.com -WhatIf -SharePointAdminUrl "https://contoso-admin.sharepoint.com"
 
 .EXAMPLE
-.\ExternalCollab.ps1 -PurgeGuests "*@fabrikam.com" -WhatIf -SharePointAdminUrl "https://contoso-admin.sharepoint.com"
+.\ExternalCollab-DenimDemon-22b555.ps1 -PurgeGuests "*@fabrikam.com" -WhatIf -SharePointAdminUrl "https://contoso-admin.sharepoint.com"
 
 .EXAMPLE
-.\ExternalCollab.ps1 -PurgePending -WhatIf -SharePointAdminUrl "https://contoso-admin.sharepoint.com"
+.\ExternalCollab-DenimDemon-22b555.ps1 -PurgeGuests "kim@fabrikam.com","*@northwind.com" -WhatIf -SharePointAdminUrl "https://contoso-admin.sharepoint.com"
 
 .EXAMPLE
-.\ExternalCollab.ps1 -PurgePending -OlderThanDays 30 -SharePointAdminUrl "https://contoso-admin.sharepoint.com"
+.\ExternalCollab-DenimDemon-22b555.ps1 -PurgePending -WhatIf -SharePointAdminUrl "https://contoso-admin.sharepoint.com"
 
 .EXAMPLE
-.\ExternalCollab.ps1 -AddEntra fabrikam.com -WhatIf -SharePointAdminUrl "https://contoso-admin.sharepoint.com"
+.\ExternalCollab-DenimDemon-22b555.ps1 -PurgePending -OlderThanDays 30 -SharePointAdminUrl "https://contoso-admin.sharepoint.com"
 
 .EXAMPLE
-.\ExternalCollab.ps1 -AddSPO fabrikam.com -SharePointAdminUrl "https://contoso-admin.sharepoint.com"
+.\ExternalCollab-DenimDemon-22b555.ps1 -AddEntra fabrikam.com -WhatIf -SharePointAdminUrl "https://contoso-admin.sharepoint.com"
 
 .EXAMPLE
-.\ExternalCollab.ps1 -AddTeams fabrikam.com -SharePointAdminUrl "https://contoso-admin.sharepoint.com"
+.\ExternalCollab-DenimDemon-22b555.ps1 -AddSPO fabrikam.com -SharePointAdminUrl "https://contoso-admin.sharepoint.com"
 
 .EXAMPLE
-.\ExternalCollab.ps1 -RemoveEntra fabrikam.com -WhatIf -SharePointAdminUrl "https://contoso-admin.sharepoint.com"
+.\ExternalCollab-DenimDemon-22b555.ps1 -AddTeams fabrikam.com -SharePointAdminUrl "https://contoso-admin.sharepoint.com"
 
 .EXAMPLE
-.\ExternalCollab.ps1 -RemoveSPO fabrikam.com -SharePointAdminUrl "https://contoso-admin.sharepoint.com"
+.\ExternalCollab-DenimDemon-22b555.ps1 -RemoveEntra fabrikam.com -WhatIf -SharePointAdminUrl "https://contoso-admin.sharepoint.com"
 
 .EXAMPLE
-.\ExternalCollab.ps1 -RemoveTeams fabrikam.com -SharePointAdminUrl "https://contoso-admin.sharepoint.com"
+.\ExternalCollab-DenimDemon-22b555.ps1 -RemoveSPO fabrikam.com -SharePointAdminUrl "https://contoso-admin.sharepoint.com"
 
 .EXAMPLE
-.\ExternalCollab.ps1 -RemoveEntra fabrikam.com,northwind.com -SharePointAdminUrl "https://contoso-admin.sharepoint.com"
+.\ExternalCollab-DenimDemon-22b555.ps1 -RemoveTeams fabrikam.com -SharePointAdminUrl "https://contoso-admin.sharepoint.com"
 
 .EXAMPLE
-.\ExternalCollab.ps1 -TeamsAudit
+.\ExternalCollab-DenimDemon-22b555.ps1 -RemoveEntra fabrikam.com,northwind.com -SharePointAdminUrl "https://contoso-admin.sharepoint.com"
 
 .EXAMPLE
-.\ExternalCollab.ps1 -Audit -FullVerbose -SharePointAdminUrl "https://contoso-admin.sharepoint.com"
+.\ExternalCollab-DenimDemon-22b555.ps1 -TeamsAudit
+
+.EXAMPLE
+.\ExternalCollab-DenimDemon-22b555.ps1 -Audit -FullVerbose -SharePointAdminUrl "https://contoso-admin.sharepoint.com"
 #>
 
 [CmdletBinding(DefaultParameterSetName = 'Audit')]
@@ -266,7 +274,7 @@ param(
     [string]$GuestDomain,
 
     [Parameter(Mandatory = $true, ParameterSetName = 'PurgeGuests')]
-    [string]$PurgeGuests,
+    [string[]]$PurgeGuests,
 
     [Parameter(Mandatory = $true, ParameterSetName = 'PurgeDomain')]
     [ValidatePattern('^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$')]
@@ -485,7 +493,7 @@ function Get-StatusStyle {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [ValidateSet('OK', 'WARN', 'ROGUE', 'FAIL', 'INFO', 'SKIP')]
+        [ValidateSet('OK', 'WARN', 'ROGUE', 'BLOCKED', 'FAIL', 'INFO', 'SKIP')]
         [string]$Status
     )
 
@@ -498,6 +506,11 @@ function Get-StatusStyle {
         }
         'ROGUE' {
             [PSCustomObject]@{ Inner = ' !! '; Ansi = $script:Nord.Orange; Fallback = 'DarkYellow' }
+        }
+        'BLOCKED' {
+            # An explicit block is a deliberate, successful configuration, not a failure,
+            # so it gets its own marker instead of borrowing the red FAIL tag.
+            [PSCustomObject]@{ Inner = ' ×× '; Ansi = $script:Nord.Orange; Fallback = 'DarkYellow' }
         }
         'FAIL' {
             [PSCustomObject]@{ Inner = ' !! '; Ansi = $script:Nord.Red;    Fallback = 'Red' }
@@ -515,7 +528,7 @@ function Write-StatusTag {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [ValidateSet('OK', 'WARN', 'ROGUE', 'FAIL', 'INFO', 'SKIP')]
+        [ValidateSet('OK', 'WARN', 'ROGUE', 'BLOCKED', 'FAIL', 'INFO', 'SKIP')]
         [string]$Status,
 
         [switch]$NoNewline
@@ -539,7 +552,7 @@ function Write-Status {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [ValidateSet('OK', 'WARN', 'ROGUE', 'FAIL', 'INFO', 'SKIP')]
+        [ValidateSet('OK', 'WARN', 'ROGUE', 'BLOCKED', 'FAIL', 'INFO', 'SKIP')]
         [string]$Status,
 
         [Parameter(Mandatory = $true)]
@@ -561,7 +574,7 @@ function Write-DetailStatus {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [ValidateSet('OK', 'WARN', 'ROGUE', 'FAIL', 'INFO', 'SKIP')]
+        [ValidateSet('OK', 'WARN', 'ROGUE', 'BLOCKED', 'FAIL', 'INFO', 'SKIP')]
         [string]$Status,
 
         [Parameter(Mandatory = $true)]
@@ -577,7 +590,7 @@ function Write-WrappedStatus {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [ValidateSet('OK', 'WARN', 'ROGUE', 'FAIL', 'INFO', 'SKIP')]
+        [ValidateSet('OK', 'WARN', 'ROGUE', 'BLOCKED', 'FAIL', 'INFO', 'SKIP')]
         [string]$Status,
 
         [Parameter(Mandatory = $true)]
@@ -656,7 +669,7 @@ function Write-SummaryMetric {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [ValidateSet('OK', 'WARN', 'ROGUE', 'FAIL', 'INFO', 'SKIP')]
+        [ValidateSet('OK', 'WARN', 'ROGUE', 'BLOCKED', 'FAIL', 'INFO', 'SKIP')]
         [string]$Status,
 
         [Parameter(Mandatory = $true)]
@@ -2980,7 +2993,15 @@ function New-ExternalCollabAudit {
                 Sort-Object -Unique
         )
 
-        if ($teamsMode -eq 'ALLOWLIST' -or $teamsMode -eq 'ALLOW_ALL') {
+        # TeamsCompared drives the inventory column only; drift calculation below uses
+        # $teamsMode directly. In ALLOW_ALL with no explicit blocks every domain is
+        # effectively allowed, so the column would be a constant [ ok ] on every row and
+        # is suppressed instead. BLOCK_ALL and DISABLED are the mirror case and already
+        # fall through as $false.
+        if ($teamsMode -eq 'ALLOWLIST') {
+            $teamsCompared = $true
+        }
+        elseif ($teamsMode -eq 'ALLOW_ALL' -and $teamsBlocked.Count -gt 0) {
             $teamsCompared = $true
         }
     }
@@ -3014,7 +3035,7 @@ function New-ExternalCollabAudit {
         elseif ($teamsMode -eq 'ALLOW_ALL') {
             $teamsIsBlocked = $teamsBlocked -contains $domain
             $inTeams = -not $teamsIsBlocked
-            $teamsStatus = if ($teamsIsBlocked) { 'FAIL' } else { 'OK' }
+            $teamsStatus = if ($teamsIsBlocked) { 'BLOCKED' } else { 'OK' }
         }
 
         $guestInfo = $guestDomains |
@@ -3401,6 +3422,16 @@ function Show-ExternalCollabAudit {
     }
 
     Write-Step 'External collaboration inventory...'
+
+    $inventoryTeamsMode = @($Audit | Select-Object -First 1 -ExpandProperty TeamsMode -ErrorAction SilentlyContinue)
+    $inventoryShowsTeams = @($Audit | Where-Object { $_.TeamsCompared } | Select-Object -First 1).Count -gt 0
+    if (-not $inventoryShowsTeams -and $inventoryTeamsMode -eq 'ALLOW_ALL') {
+        Write-WrappedStatus -Status INFO -Message 'Microsoft Teams column omitted: ALLOW_ALL with no explicit blocks, so every domain is effectively allowed. Use -TeamsAudit to review the stored allowlist that would apply if the mode changes.'
+    }
+    elseif ($inventoryShowsTeams -and $inventoryTeamsMode -eq 'ALLOW_ALL') {
+        Write-Status -Status INFO -Message 'Microsoft Teams ALLOW_ALL: [ ×× ] marks an explicit block, every other domain is implicitly allowed'
+    }
+
     Write-ExternalCollabAuditTable -Audit $Audit
 
     Show-DriftRecommendations -Audit $Audit
@@ -3698,6 +3729,32 @@ function Resolve-ExternalGuestPurgeSelector {
     }
 }
 
+function Resolve-ExternalGuestPurgeSelectorList {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [string[]]$Selector
+    )
+
+    $resolved = @()
+    $seen = @{}
+
+    foreach ($candidate in $Selector) {
+        if ([string]::IsNullOrWhiteSpace([string]$candidate)) { continue }
+
+        $entry = Resolve-ExternalGuestPurgeSelector -Selector ([string]$candidate)
+        if ($seen.ContainsKey($entry.Selector)) { continue }
+
+        $seen[$entry.Selector] = $true
+        $resolved += $entry
+    }
+
+    if ($resolved.Count -eq 0) { throw 'PurgeGuests requires at least one selector.' }
+
+    return $resolved
+}
+
 function Select-ExternalGuestsForPurge {
     [CmdletBinding()]
     param(
@@ -3864,14 +3921,16 @@ function Invoke-ExternalCollabPurgeGuests {
         [string]$SharePointAdminUrl,
 
         [Parameter(Mandatory = $true)]
-        [string]$Selector,
+        [string[]]$Selector,
 
         [switch]$WhatIf
     )
 
-    $resolvedSelector = Resolve-ExternalGuestPurgeSelector -Selector $Selector
+    $resolvedSelectors = @(Resolve-ExternalGuestPurgeSelectorList -Selector $Selector)
+    $selectorText = (@($resolvedSelectors | ForEach-Object { $_.Selector }) -join ', ')
 
-    Write-Step ("Purge external guest users: {0}" -f $resolvedSelector.Selector)
+    if ($resolvedSelectors.Count -eq 1) { Write-Step ("Purge external guest users: {0}" -f $selectorText) }
+    else { Write-Step ("Purge external guest users: {0} selectors ({1})" -f $resolvedSelectors.Count, $selectorText) }
 
     $graphScopes = $script:PurgeGuestGraphScopes
     if ($WhatIf) {
@@ -3883,17 +3942,37 @@ function Invoke-ExternalCollabPurgeGuests {
         -SharePointAdminUrl $SharePointAdminUrl `
         -GraphScopes $graphScopes
 
+    # Selectors may overlap (user@x.fi and *@x.fi both match the same object), so matches
+    # are de-duplicated by object id. Each account is previewed and deleted exactly once.
     # NOTE: $matches is a PowerShell automatic variable. Never reuse that name here.
-    $targets = @(
-        Select-ExternalGuestsForPurge `
-            -Guests $preflight.Guests `
-            -Selector $resolvedSelector |
-            Sort-Object Domain, DisplayName, Mail
-    )
+    $seenIds = @{}
+    $collected = @()
+    $unmatchedSelectors = @()
+
+    foreach ($entry in $resolvedSelectors) {
+        $entryMatches = @(Select-ExternalGuestsForPurge -Guests $preflight.Guests -Selector $entry)
+        if ($entryMatches.Count -eq 0) {
+            $unmatchedSelectors += $entry.Selector
+            continue
+        }
+
+        foreach ($guest in $entryMatches) {
+            $key = [string]$guest.Id
+            if ($seenIds.ContainsKey($key)) { continue }
+            $seenIds[$key] = $true
+            $collected += $guest
+        }
+    }
+
+    $targets = @($collected | Sort-Object Domain, DisplayName, Mail)
+
+    Write-Step 'Guest accounts scheduled for purge...'
+
+    foreach ($selectorValue in $unmatchedSelectors) {
+        Write-Status -Status WARN -Message ("No #EXT# guest accounts matched {0}" -f $selectorValue)
+    }
 
     if ($targets.Count -eq 0) {
-        Write-Step 'Guest accounts scheduled for purge...'
-        Write-Status -Status WARN -Message ("No #EXT# guest accounts matched {0}" -f $resolvedSelector.Selector)
         Write-Status -Status OK -Message 'No changes were made'
         return
     }
@@ -3901,10 +3980,18 @@ function Invoke-ExternalCollabPurgeGuests {
     $inviterMetadata = Resolve-ExternalGuestInviterMetadata -Guests $targets
     $targets = @($inviterMetadata.Guests)
 
-    Write-Step 'Guest accounts scheduled for purge...'
-    Write-ExternalGuestPurgeTable -Guests $targets -IncludeDomain:($resolvedSelector.Type -eq 'ExactEmail')
+    # Show the domain column whenever the result set is not confined to a single domain,
+    # or when an exact address was requested and the domain is not otherwise visible.
+    $distinctDomains = @($targets | ForEach-Object { $_.Domain } | Sort-Object -Unique)
+    $includeDomain = ($distinctDomains.Count -gt 1) -or @($resolvedSelectors | Where-Object { $_.Type -eq 'ExactEmail' }).Count -gt 0
+
+    Write-ExternalGuestPurgeTable -Guests $targets -IncludeDomain:$includeDomain
 
     Write-Host
+    if ($resolvedSelectors.Count -gt 1) {
+        Write-SummaryMetric -Status OK -Label 'Selectors matched' -Value ($resolvedSelectors.Count - $unmatchedSelectors.Count)
+        Write-SummaryMetric -Status OK -Label 'Domains affected' -Value $distinctDomains.Count
+    }
     Write-SummaryMetric -Status OK -Label 'Inviter identified' -Value $inviterMetadata.InviterIdentified
     if ($inviterMetadata.InviterUnavailable -gt 0) {
         Write-SummaryMetric -Status WARN -Label 'Inviter unavailable' -Value $inviterMetadata.InviterUnavailable
