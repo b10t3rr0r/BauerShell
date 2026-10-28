@@ -23,6 +23,13 @@
         0 = infinite (until Ctrl-C).
         Otherwise exits after ~Duration seconds.
 
+    -BarStyle <Auto|Block|Braille|Ascii>
+        Style of the signal bars. Auto (default): braille bars in PowerShell 7 and in
+        Windows Terminal (also with Windows PowerShell 5.1), plain ASCII bars
+        ([=====   ]) in the old console host.
+        Braille draws half-character steps and needs a font with braille glyphs; Block
+        draws full block characters; Ascii forces plain ASCII.
+
     -NoCellInfo
         Skip the serving cell section (band, channel, PCI, cell ID, RSRP/RSRQ).
         Cell info is read through the Windows MobileBroadbandCellsInfo API. It works
@@ -42,6 +49,8 @@
       MobileBroadbandCellsInfo API. SINR, bandwidth and carrier aggregation are not
       exposed by it. The 5G NR part of an NSA connection is only shown if the driver reports it.
     - RSRP/RSRQ colors follow the Teltonika signal strength recommendations.
+    - Cell changes (band, eNB/cell), IP address, connection state and data class changes since the
+      script started appear as extra rows under "Serving cell" (a cell is shown as <band> <eNB>/<cell>).
 #>
 
 param(
@@ -53,7 +62,10 @@ param(
   [ValidateRange(0, [int]::MaxValue)]
   [int]$Duration = 0,
 
-  [switch]$NoCellInfo
+  [switch]$NoCellInfo,
+
+  [ValidateSet('Auto', 'Block', 'Braille', 'Ascii')]
+  [string]$BarStyle = 'Auto'
 )
 
 # Version variable - change this in one place, it updates the banner automatically
@@ -71,6 +83,15 @@ $script:RegexIgnoreCaseMultiline = `
 
 # "Connected" must match exactly - a plain -match "connected" also matches "Disconnected"
 $script:ConnectedPattern = '^\s*connected\s*$'
+
+# Bar style. Auto = braille bars in PowerShell 7 or in Windows Terminal (WT_SESSION is set,
+# also with Windows PowerShell 5.1), ASCII bars in the old console host.
+# (The block / braille characters are written as [char] codes: this file has no BOM, so
+#  Windows PowerShell 5.1 would misread literal non-ASCII characters.)
+$script:ResolvedBarStyle = $BarStyle
+if ($BarStyle -eq 'Auto') {
+  $script:ResolvedBarStyle = if ($PSVersionTable.PSEdition -eq 'Core' -or $env:WT_SESSION) { 'Braille' } else { 'Ascii' }
+}
 
 # Serving cell info (WinRT MobileBroadbandCellsInfo). Disabled automatically after 3 failed queries.
 $script:CellInfoEnabled  = -not $NoCellInfo
@@ -322,6 +343,36 @@ function Write-ColorText {
   }
 }
 
+function Write-AddrField {
+  # IPv4 and IPv6 in two aligned columns: "Label : 176.93.20.11     2001:db8::1"
+  # On a narrow console only IPv4 is shown (IPv6 would be cut off).
+  param([string]$Label, $V4, $V6, [int]$Width = 80)
+
+  $col  = 18                    # IPv4 column ("255.255.255.255" is 15 characters + gap)
+  $room = $Width - 20
+  $t4 = if ($null -eq $V4) { '' } else { [string]$V4 }
+  $t6 = if ($null -eq $V6) { '' } else { [string]$V6 }
+
+  Write-Host ("{0,-18}: " -f $Label) -ForegroundColor DarkGray -NoNewline
+  if ($t6 -and $room -gt ($col + 4)) {
+    Write-ColorText ("{0,-18}" -f $t4) 'White'
+    Write-ColorText (Limit-Text $t6 ($room - $col)) 'Gray'
+  } else {
+    $only = if ($t4) { $t4 } else { $t6 }
+    Write-ColorText (Limit-Text $only $room) 'White'
+  }
+  Write-Host ''
+}
+
+function Write-SectionHeader {
+  # "[ Title ] ------------------" on one line
+  param([string]$Title, [int]$Width = 80)
+  $text    = "[ $Title ] "
+  $ruleLen = [Math]::Max(0, $Width - $text.Length)
+  Write-Host $text -ForegroundColor Cyan -NoNewline
+  Write-Host ('-' * $ruleLen) -ForegroundColor Gray
+}
+
 function Write-BarField {
   # "Label             : value    [=====     ]  (text)" line, bar and text colored with Color.
   param(
@@ -335,9 +386,32 @@ function Write-BarField {
   )
   Write-Host ("{0,-18}: " -f $Label) -ForegroundColor DarkGray -NoNewline
   Write-ColorText ("{0,-9}" -f $ValueText) $Color
-  Write-Host "[" -ForegroundColor White -NoNewline
-  Write-ColorText (New-SignalBar -Percent $Percent -Width $BarWidth) $Color
-  Write-Host "]" -ForegroundColor White -NoNewline
+  switch ($script:ResolvedBarStyle) {
+    'Block' {
+      # block characters, filled part in the level color, empty part dim, no brackets
+      $filled = [int][Math]::Floor(($Percent * $BarWidth) / 100.0)
+      $filled = [Math]::Max(0, [Math]::Min($BarWidth, $filled))
+      Write-ColorText (([string][char]0x2588) * $filled) $Color
+      Write-ColorText (([string][char]0x2591) * ($BarWidth - $filled)) 'DarkGray'
+    }
+    'Braille' {
+      # braille: full cell U+28FF, half cell U+28C7, empty cell U+28C0 (thin baseline); half-cell resolution
+      $units = [int][Math]::Floor(($Percent * $BarWidth * 2) / 100.0)
+      $units = [Math]::Max(0, [Math]::Min($BarWidth * 2, $units))
+      $full  = [int][Math]::Floor($units / 2)
+      $half  = $units % 2
+      $empty = $BarWidth - $full - $half
+      $filledText = ([string][char]0x28FF) * $full
+      if ($half -eq 1) { $filledText += [string][char]0x28C7 }
+      Write-ColorText $filledText $Color
+      Write-ColorText (([string][char]0x28C0) * $empty) 'DarkGray'
+    }
+    default {
+      Write-Host "[" -ForegroundColor White -NoNewline
+      Write-ColorText (New-SignalBar -Percent $Percent -Width $BarWidth) $Color
+      Write-Host "]" -ForegroundColor White -NoNewline
+    }
+  }
   # the level text is dropped / shortened when the console is too narrow
   Write-ColorText (Limit-Text $Suffix ($Width - (20 + 9 + 2 + $BarWidth))) $Color
   Write-Host ''
@@ -442,6 +516,91 @@ function Get-MbnCellInfo {
     if ($script:CellInfoFailures -ge 3) { $script:CellInfoEnabled = $false }
     return $null
   }
+}
+
+# ====================================================================
+#                         CHANGE LOG
+# ====================================================================
+
+$script:Changes   = @()
+$script:PrevState = $null
+$script:StartedAt = Get-Date
+
+# Short cell label, e.g. "B1 8847/22" (band, eNB/cell). Used for change detection and display.
+function Get-LteCellLabel {
+  param($Lte)
+  if (-not $Lte) { return '' }
+
+  $band = '?'
+  if ($null -ne $Lte.ChannelNumber) {
+    $bandInfo = Get-LteBandInfo ([int]$Lte.ChannelNumber)
+    if ($bandInfo) {
+      $band = 'B' + [string]$bandInfo.Band
+    } else {
+      $band = 'EARFCN ' + [string]$Lte.ChannelNumber
+    }
+  }
+  if ($null -ne $Lte.CellId) {
+    $cellId = [long]$Lte.CellId
+    $enb    = [long][Math]::Floor($cellId / 256)
+    $local  = $cellId % 256
+    return ('{0} {1}/{2}' -f $band, $enb, $local)
+  }
+  return ('{0} PCI {1}' -f $band, $Lte.PhysicalCellId)
+}
+
+function Add-ChangeEvent {
+  param([datetime]$Time, [string]$Kind, [string]$Text, [string]$Color = 'White')
+  $ev = [pscustomobject]@{ Time = $Time; Kind = $Kind; Text = $Text; Color = $Color }
+  # newest first, at most 10 kept (plain array, no generic list)
+  $list = @($ev) + @($script:Changes)
+  if ($list.Count -gt 10) { $list = $list[0..9] }
+  $script:Changes = $list
+}
+
+# Compares the current data with the previous round and records what changed.
+# A value that is missing now (e.g. a failed query) is never logged as a change.
+function Update-ChangeLog {
+  param($Info, [datetime]$Time)
+
+  $cellLabel = ''
+  if ($Info.CellInfo -and $Info.CellInfo.Lte) { $cellLabel = Get-LteCellLabel $Info.CellInfo.Lte }
+
+  $cur = @{
+    Cell      = [string]$cellLabel
+    Ip4       = [string]$Info.IPv4
+    Ip6       = [string]$Info.IPv6
+    State     = [string]$Info.State
+    DataClass = [string]$Info.DataClass
+  }
+
+  $prev = $script:PrevState
+  if ($prev) {
+    if ($prev['Cell'] -and $cur['Cell'] -and ($prev['Cell'] -ne $cur['Cell'])) {
+      Add-ChangeEvent $Time 'Cell' ('{0}  ->  {1}' -f $prev['Cell'], $cur['Cell']) 'Yellow'
+    }
+    if ($prev['Ip4'] -and $cur['Ip4'] -and ($prev['Ip4'] -ne $cur['Ip4'])) {
+      Add-ChangeEvent $Time 'IPv4' ('{0}  ->  {1}' -f $prev['Ip4'], $cur['Ip4']) 'White'
+    }
+    elseif ($prev['Ip6'] -and $cur['Ip6'] -and ($prev['Ip6'] -ne $cur['Ip6'])) {
+      Add-ChangeEvent $Time 'IPv6' 'address changed' 'White'
+    }
+    if ($prev['State'] -and $cur['State'] -and ($prev['State'] -ne $cur['State'])) {
+      Add-ChangeEvent $Time 'State' ('{0}  ->  {1}' -f $prev['State'], $cur['State']) 'Yellow'
+    }
+    if ($prev['DataClass'] -and $cur['DataClass'] -and ($prev['DataClass'] -ne $cur['DataClass'])) {
+      Add-ChangeEvent $Time 'Data class' ('{0}  ->  {1}' -f $prev['DataClass'], $cur['DataClass']) 'White'
+    }
+  }
+
+  # keep the last known non-empty values, so a missing value does not hide a later real change
+  $next = @{}
+  foreach ($k in @($cur.Keys)) {
+    $v = $cur[$k]
+    if (-not $v -and $prev) { $v = $prev[$k] }
+    $next[$k] = $v
+  }
+  $script:PrevState = $next
 }
 
 # ====================================================================
@@ -555,6 +714,8 @@ function Show-MbnScreen {
     [datetime]$Time,
     [string]$PreferredName,
     [int]$Interval,
+    $Changes,
+    [datetime]$StartTime,
     [int]$Width
   )
 
@@ -574,6 +735,9 @@ function Show-MbnScreen {
   $rxRate  = $RxRate
   $txRate  = $TxRate
   $info    = $Info
+  $cell    = $info.CellInfo
+  $lte     = if ($cell) { $cell.Lte } else { $null }
+  $nr      = if ($cell) { $cell.Nr }  else { $null }
 
   # --- signal ---
   $sigPct = if ($null -ne $info.SignalPercent) { $info.SignalPercent } else { 0 }
@@ -587,12 +751,11 @@ function Show-MbnScreen {
     $rssiText = "~$rssi dBm"
   }
 
-  $radioColor = Get-RadioColor $info.CellularClass
+  $radioColor   = Get-RadioColor $info.CellularClass
+  $netTypeColor = if ($info.NetworkType -match '^3GPP$') { 'DarkCyan' } elseif ($info.NetworkType -match '\S') { 'Yellow' } else { 'Gray' }
 
   # Bar rows (Signal / RSRP / RSRQ): 20 (label) + 9 (value) + 2 (brackets) + ~21 ("  (35%, fair to poor)") around the bar
   $barWidth = [Math]::Max(8, [Math]::Min(25, $width - 54))
-
-  $line = "".PadRight([Math]::Min(80, $width), '-')
 
   # -------------------- HEADER (scales to the console width) --------------------
   $timePart    = "{0:yyyy-MM-dd HH:mm:ss}" -f $Time
@@ -623,74 +786,48 @@ function Show-MbnScreen {
 
   $headerLen = $headerPrefix.Length + $nameShown.Length
   if ($descShown) { $headerLen += $descShown.Length + 3 }
-  Write-Host ("".PadRight([Math]::Min($headerLen, $width), '=')) -ForegroundColor Gray
-  "" | Out-Host
+  # section rules are as wide as the header line
+  $ruleWidth = [Math]::Min($headerLen, $width)
 
   # -------------------- CONNECTION --------------------
-  Write-Host "[ Connection ]" -ForegroundColor Cyan
-  Write-Host $line -ForegroundColor Gray
+  Write-SectionHeader "Connection" $ruleWidth
 
   $stateColor = if ($info.State -match $script:ConnectedPattern) { "Green" } else { "Yellow" }
+  Write-Field "State" $info.State $stateColor $width
 
-  Write-Field "State"        $info.State    $stateColor $width
-  Write-Field "Provider"     $info.Provider 'White'     $width
-  Write-Field "Roaming"      $info.Roaming  'White'     $width
+  # Provider + MCC-MNC (from the serving cell, when known) + roaming
+  $provText = [string]$info.Provider
+  if ($lte) {
+    $plmnRaw = [string]$lte.ProviderId
+    if ($plmnRaw.Length -ge 5) { $provText += ("  {0}-{1}" -f $plmnRaw.Substring(0,3), $plmnRaw.Substring(3)) }
+  }
+  if ($info.Roaming) { $provText += ("  ({0})" -f $info.Roaming) }
+  $roamColor = if ($info.Roaming -match '^\s*not\b') { 'White' } elseif ($info.Roaming) { 'Yellow' } else { 'White' }
+  Write-Field "Provider" $provText $roamColor $width
 
-  # Signal uses the same dBm scale and Teltonika levels as RSRP, so the rows agree with each other
-  # (the modem's own percentage is shown in the text, but no longer decides the color)
   $sigLvl = Get-RsrpLevel $rssi
   Write-BarField "Signal" $rssiText (ConvertTo-BarPercent -Value $rssi -Low -110 -High -70) $sigLvl[0] ("  ({0}%, {1})" -f $sigPct, $sigLvl[1]) $barWidth $width
 
-  Write-Field "Device"       $info.DeviceType    'Gray'      $width
-  Write-Field "Radio class"  $info.CellularClass $radioColor $width
-  $netTypeColor = if ($info.NetworkType -match '^3GPP$') { 'DarkCyan' } elseif ($info.NetworkType -match '\S') { 'Yellow' } else { 'Gray' }
-  Write-Field "Network type" $info.NetworkType   $netTypeColor $width
-  Write-Field "Data class"   $info.DataClass     (Get-RadioColor $info.DataClass) $width
+  # Radio class (colored by class) + network type (colored)
+  Write-Host ("{0,-18}: " -f "Radio class") -ForegroundColor DarkGray -NoNewline
+  Write-ColorText (Limit-Text ([string]$info.CellularClass) ($width - 20)) $radioColor
+  if ($info.NetworkType) { Write-ColorText ("  ({0})" -f $info.NetworkType) $netTypeColor }
+  Write-Host ''
 
-  # IP address (v4 + first global v6 if present)
-  $ipSummary = $info.IPv4
-  if ($info.IPv6) {
-    $ipSummary = "{0}  |  {1}" -f $info.IPv4, $info.IPv6
-  }
-  Write-Field "IP address" $ipSummary 'White' $width
+  Write-Field "Data class" $info.DataClass (Get-RadioColor $info.DataClass) $width
 
-  # Gateway summary (v4 + v6)
-  $gw4 = $info.Gateway4
-  $gw6 = $info.Gateway6
-  if ($gw4 -and $gw6) {
-    $gwSummary = "{0}  |  {1}" -f $gw4, $gw6
-  } elseif ($gw4) {
-    $gwSummary = $gw4
-  } else {
-    $gwSummary = $gw6
-  }
-  Write-Field "Gateway" $gwSummary 'White' $width
-
-  # Compact DNS line if we have anything
+  # IPv4 and IPv6 in two aligned columns
+  Write-AddrField "IP address" $info.IPv4     $info.IPv6     $width
+  Write-AddrField "Gateway"    $info.Gateway4 $info.Gateway6 $width
   if ($info.Dns4 -or $info.Dns6) {
-    if ($info.Dns4 -and $info.Dns6) {
-      $dnsSummary = "{0}  |  {1}" -f $info.Dns4, $info.Dns6
-    } elseif ($info.Dns4) {
-      $dnsSummary = $info.Dns4
-    } else {
-      $dnsSummary = $info.Dns6
-    }
-    Write-Field "DNS" $dnsSummary 'White' $width
+    Write-AddrField "DNS"       $info.Dns4     $info.Dns6     $width
   }
-
-  Write-Field "Model"    $info.Model 'Gray' $width
-  Write-Field "Mfr / FW" ("{0} / {1}" -f $info.Manufacturer, $info.Firmware) 'Gray' $width
 
   "" | Out-Host
 
   # -------------------- SERVING CELL --------------------
-  $cell = $info.CellInfo
   if ($cell -or $script:CellInfoEnabled) {
-    Write-Host "[ Serving cell ]" -ForegroundColor Cyan
-    Write-Host $line -ForegroundColor Gray
-
-    $lte = if ($cell) { $cell.Lte } else { $null }
-    $nr  = if ($cell) { $cell.Nr }  else { $null }
+    Write-SectionHeader "Serving cell" $ruleWidth
 
     if ($lte) {
       $earfcn   = $lte.ChannelNumber
@@ -704,12 +841,10 @@ function Show-MbnScreen {
 
       if ($null -ne $lte.CellId) {
         $cid = [long]$lte.CellId
-        Write-Field "Cell ID" ("{0}  (eNB {1}, cell {2})" -f $cid, ($cid -shr 8), ($cid -band 255)) 'White' $width
+        $cellText = "{0}  (eNB {1}, cell {2}" -f $cid, ($cid -shr 8), ($cid -band 255)
+        if ($null -ne $lte.TrackingAreaCode) { $cellText += (", TAC {0}" -f $lte.TrackingAreaCode) }
+        Write-Field "Cell ID" ($cellText + ")") 'White' $width
       }
-
-      $prov = [string]$lte.ProviderId
-      $plmn = if ($prov.Length -ge 5) { "{0}-{1}" -f $prov.Substring(0,3), $prov.Substring(3) } else { '-' }
-      Write-Field "TAC / MCC-MNC" ("{0} / {1}" -f $lte.TrackingAreaCode, $plmn) 'White' $width
 
       # Bars: RSRP -110..-70 dBm and RSRQ -25..-5 dB, so the four Teltonika levels fall on quarters
       if ($null -ne $lte.ReferenceSignalReceivedPowerInDBm) {
@@ -726,6 +861,7 @@ function Show-MbnScreen {
       Write-Field "LTE" "not reported by the driver" 'Gray' $width
     }
 
+    # 5G NR rows only appear if the driver reports an NR cell
     if ($nr) {
       # NR property names are read defensively, since drivers differ in what they report
       $nrProp = { param($n) $pp = $nr.PSObject.Properties[$n]; if ($pp) { $pp.Value } else { $null } }
@@ -736,9 +872,8 @@ function Show-MbnScreen {
       $nrSinr  = & $nrProp 'SignalToNoiseRatioInDB'
 
       if ($null -ne $nrArfcn) {
-        Write-Field "NR-ARFCN" ("{0}  ({1:F1} MHz)" -f $nrArfcn, (Get-NrFreqMHz $nrArfcn)) 'White' $width
+        Write-Field "NR-ARFCN / PCI" ("{0}  ({1:F1} MHz) / {2}" -f $nrArfcn, (Get-NrFreqMHz $nrArfcn), $nrPci) 'White' $width
       }
-      if ($null -ne $nrPci) { Write-Field "NR PCI" $nrPci 'White' $width }
       if ($null -ne $nrRsrp) {
         $lvl = Get-RsrpLevel $nrRsrp
         Write-BarField "NR RSRP" ("{0} dBm" -f $nrRsrp) (ConvertTo-BarPercent -Value $nrRsrp -Low -110 -High -70) $lvl[0] ("  ({0})" -f $lvl[1]) $barWidth $width
@@ -752,52 +887,57 @@ function Show-MbnScreen {
         Write-BarField "NR SINR" ("{0} dB" -f $nrSinr) (ConvertTo-BarPercent -Value $nrSinr -Low -5 -High 25) $lvl[0] ("  ({0})" -f $lvl[1]) $barWidth $width
       }
     }
-    elseif ($info.DataClass -match '5G') {
-      Write-Field "5G NR" "not reported by the driver" 'Gray' $width
+
+    # Changes since start (cell / IP / state / data class): rows appear only when something changed
+    if ($Changes -and @($Changes).Count -gt 0) {
+      foreach ($e in (@($Changes) | Select-Object -First 3)) {
+        Write-Field $e.Kind ("{0:HH:mm:ss}  {1}" -f $e.Time, $e.Text) $e.Color $width
+      }
     }
 
     "" | Out-Host
   }
 
   # -------------------- LINK / TRAFFIC --------------------
-  Write-Host "[ Link / Traffic ]" -ForegroundColor Cyan
-  Write-Host $line -ForegroundColor Gray
-
-  # Link rate: just show whatever Windows reports (string or number)
-  $linkRateText = "N/A"
-  if ($adapter -and $adapter.LinkSpeed) {
-    $linkRateText = [string]$adapter.LinkSpeed
-  }
-  Write-Field "Link rate" $linkRateText 'White' $width
+  Write-SectionHeader "Link / Traffic" $ruleWidth
 
   Write-Host ("{0,-18}: " -f "Throughput") -ForegroundColor DarkGray -NoNewline
   if ($null -ne $rxRate -and $null -ne $txRate) {
-    Write-Host ("{0:N2} Mbit/s (down) | {1:N2} Mbit/s (up)" -f $rxRate, $txRate) -ForegroundColor White
+    $tpText = "{0:N2} Mbit/s (down) | {1:N2} Mbit/s (up)" -f $rxRate, $txRate
+    Write-ColorText (Limit-Text $tpText ($width - 20)) 'White'
+    # link rate as a dim suffix, if there is room
+    if ($adapter -and $adapter.LinkSpeed) {
+      $room = $width - 20 - $tpText.Length
+      Write-ColorText (Limit-Text ("  (link {0})" -f $adapter.LinkSpeed) $room) 'DarkGray'
+    }
   } else {
-    Write-Host "(warming up... or unavailable)" -ForegroundColor Yellow
+    Write-ColorText "(warming up... or unavailable)" 'Yellow'
   }
+  Write-Host ''
 
   Write-Field "Data total" ("{0} (rx) | {1} (tx)" -f (Format-Bytes $info.RxBytes), (Format-Bytes $info.TxBytes)) 'White' $width
 
   "" | Out-Host
 
   # -------------------- DEVICE / IDENTITY --------------------
-  Write-Host "[ Device / Identity ]" -ForegroundColor Cyan
-  Write-Host $line -ForegroundColor Gray
+  Write-SectionHeader "Device / Identity" $ruleWidth
 
-  # --- DEVICE FIRST ---
+  $modemText = if ($info.Model) { [string]$info.Model } elseif ($adapter) { [string]$adapter.InterfaceDescription } else { '' }
+  $mfrFw = @()
+  if ($info.Manufacturer) { $mfrFw += [string]$info.Manufacturer }
+  if ($info.Firmware)     { $mfrFw += ("FW {0}" -f $info.Firmware) }
+  if ($mfrFw.Count -gt 0) { $modemText += ("  ({0})" -f ($mfrFw -join ', ')) }
+  Write-Field "Modem" $modemText 'White' $width
+
   if ($adapter) {
-    Write-Field "Description" $adapter.InterfaceDescription 'White' $width
-    Write-Field "MAC"         $adapter.MacAddress          'White' $width
-    Write-Field "Driver info" $adapter.DriverInformation   'White' $width
-    Write-Field "Driver file" $adapter.DriverFileName      'White' $width
+    Write-Field "MAC"         $adapter.MacAddress        'White' $width
+    Write-Field "Driver info" $adapter.DriverInformation 'White' $width
   }
 
+  # SIM / subscriber
   "" | Out-Host
-
-  # --- THEN SIM / SUBSCRIBER ---
-  Write-Field "IMEI"          $info.IMEI        'White' $width
   Write-Field "Phone number"  $info.PhoneNumber 'White' $width
+  Write-Field "IMEI"          $info.IMEI        'White' $width
   Write-Field "IMSI / Sub ID" $info.IMSI        'White' $width
   Write-Field "SIM ICC ID"    $info.SimIcc      'White' $width
 
@@ -854,6 +994,9 @@ while ($true) {
       $lastTx        = $info.TxBytes
       $lastSampleSec = $sampleSec
 
+      # record cell / IP / state / data class changes
+      Update-ChangeLog -Info $info -Time $now
+
       # grab NIC once (for link rate + driver info)
       try {
         $adapter = Get-NetAdapter -Name $info.Name -ErrorAction Stop
@@ -871,6 +1014,8 @@ while ($true) {
       Time          = $now
       PreferredName = $Interface
       Interval      = $Interval
+      Changes       = $script:Changes
+      StartTime     = $script:StartedAt
     }
 
     # ---- draw ----
@@ -893,7 +1038,9 @@ while ($true) {
     }
   }
   catch {
-    Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red
+    $where = ''
+    try { $where = ("  (line {0}: {1})" -f $_.InvocationInfo.ScriptLineNumber, $_.InvocationInfo.Line.Trim()) } catch {}
+    Write-Host ("Error: " + $_.Exception.Message + $where) -ForegroundColor Red
     Start-Sleep -Seconds $Interval
   }
 }
