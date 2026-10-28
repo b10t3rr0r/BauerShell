@@ -16,6 +16,7 @@
   - Tracks per-interval throughput (down/up Mbit/s) and total bytes transferred
   - Lists nearby SSIDs, merging 2.4 GHz, 5 GHz and 6 GHz information for each network
   - Header, separators and lists scale to the current console width
+  - Flicker-free: the screen is redrawn in place instead of cleared on every refresh
   - Requires no external modules or tools – only `netsh` and built-in cmdlets
 
   Parameters
@@ -78,6 +79,8 @@
     A scan takes a few seconds, so the list is read ~4 s after each request. Scanning very
     often can briefly disturb the connected adapter, so don't set -ScanInterval too low.
   - The currently connected SSID is marked with * in the nearby list.
+  - In-place redraw needs a console window tall enough for the whole display (~35 rows).
+    If it is too short, the script falls back to clearing the screen on every refresh.
 #>
 
 param(
@@ -415,6 +418,54 @@ function Get-NearbyNetworks {
   $agg | Sort-Object -Property @{Expression='OverallSignal';Descending=$true},SSID
 }
 
+# ---- Flicker-free redraw ---------------------------------------------------
+# Instead of clearing the screen every refresh, the cursor is moved to the top-left
+# and every line is overwritten in place. Write-Host is wrapped so each line ends with
+# "erase to end of line" (ESC[K), and ESC[J after the frame erases anything left below.
+
+function Write-Host {
+  [CmdletBinding()]
+  param(
+    [Parameter(Position = 0, ValueFromRemainingArguments = $true)][object[]]$Object,
+    [object]$Separator = ' ',
+    [ConsoleColor]$ForegroundColor,
+    [ConsoleColor]$BackgroundColor,
+    [switch]$NoNewline
+  )
+  $text = (($Object | ForEach-Object { "$_" }) -join "$Separator")
+  if (-not $NoNewline) { $text += "`e[K" }
+  $splat = @{ Object = $text; NoNewline = $NoNewline }
+  if ($PSBoundParameters.ContainsKey('ForegroundColor')) { $splat.ForegroundColor = $ForegroundColor }
+  if ($PSBoundParameters.ContainsKey('BackgroundColor')) { $splat.BackgroundColor = $BackgroundColor }
+  Microsoft.PowerShell.Utility\Write-Host @splat
+}
+
+$Script:FrameW = 0
+$Script:FrameH = 0
+$Script:FirstFrame = $true
+$Script:UseClear = $false    # set if the frame is taller than the window (then in-place redraw can't work)
+
+function Start-Frame {
+  try {
+    $ws = $Host.UI.RawUI.WindowSize
+    if ($Script:FirstFrame -or $Script:UseClear -or $ws.Width -ne $Script:FrameW -or $ws.Height -ne $Script:FrameH) {
+      Clear-Host
+      $Script:FirstFrame = $false
+      $Script:FrameW = $ws.Width
+      $Script:FrameH = $ws.Height
+    } else {
+      [Console]::SetCursorPosition(0, 0)
+    }
+  } catch { Clear-Host }
+}
+
+function Stop-Frame {
+  try {
+    [Console]::Write("`e[J")
+    if ([Console]::CursorTop -ge ($Host.UI.RawUI.WindowSize.Height - 1)) { $Script:UseClear = $true }
+  } catch {}
+}
+
 # ---- Main loop -------------------------------------------------------------
 
 $sw = [Diagnostics.Stopwatch]::StartNew()
@@ -432,240 +483,248 @@ $scanStatus      = ''
 
 Write-Host "Starting Wi-Fi monitor v$WifiMonitorVersion. Press Ctrl-C to stop.`n"
 
-while ($true) {
+try { [Console]::CursorVisible = $false } catch {}
+try {
+  while ($true) {
 
-  # Duration check at the top of the loop, so it also applies after errors / "no WLAN info"
-  if ($Duration -gt 0 -and $sw.Elapsed.TotalSeconds -ge $Duration) {
-    Write-Host "`nDuration limit reached (~$([int]$sw.Elapsed.TotalSeconds)s). Exiting..." -ForegroundColor Cyan
-    break
-  }
-
-  try {
-    $info      = Get-WifiInterfaceInfo -PreferredAlias $Interface
-    $sampleSec = $sw.Elapsed.TotalSeconds     # timestamp right next to the byte counters
-    $now       = Get-Date
-    $width     = Get-ConsoleWidth
-
-    if (-not $info) {
-      Clear-Host
-      if ($Interface) {
-        Write-Host (Limit-Text "Interface '$Interface' not found (or no WLAN info). Check the name with: netsh wlan show interfaces" ($width * 2)) -ForegroundColor Yellow
-      } else {
-        Write-Host "No WLAN info found. Are you on Wi-Fi, and is the adapter enabled?" -ForegroundColor Yellow
-      }
-      $lastRx = $null; $lastTx = $null; $lastSampleSec = $null
+    # Duration check at the top of the loop, so it also applies after errors / "no WLAN info"
+    if ($Duration -gt 0 -and $sw.Elapsed.TotalSeconds -ge $Duration) {
+      Write-Host "`nDuration limit reached (~$([int]$sw.Elapsed.TotalSeconds)s). Exiting..." -ForegroundColor Cyan
+      break
     }
-    else {
 
-      $sigPct = if ($null -ne $info.SignalPct) { [int]$info.SignalPct } else { 0 }
+    try {
+      $info      = Get-WifiInterfaceInfo -PreferredAlias $Interface
+      $sampleSec = $sw.Elapsed.TotalSeconds     # timestamp right next to the byte counters
+      $now       = Get-Date
+      $width     = Get-ConsoleWidth
 
-      if ($null -ne $info.Rssi) {
-        $rssi     = $info.Rssi
-        $rssiText = "$rssi dBm"
-      } else {
-        $rssi     = [int]([math]::Round(($sigPct / 2) - 100))
-        $rssiText = "~$rssi dBm"
-      }
-
-      # Throughput (Mbit/s, decimal: 1 Mbit = 1,000,000 bits)
-      $rxRate = $null; $txRate = $null
-      if ($null -ne $lastRx -and $null -ne $lastTx -and $null -ne $lastSampleSec -and
-          $null -ne $info.RxBytes -and $null -ne $info.TxBytes) {
-        $dt  = $sampleSec - $lastSampleSec
-        $dRx = $info.RxBytes - $lastRx
-        $dTx = $info.TxBytes - $lastTx
-        # A negative delta means the counters were reset (reconnect / adapter reset)
-        if ($dt -gt 0 -and $dRx -ge 0 -and $dTx -ge 0) {
-          $rxRate = $dRx * 8 / $dt / 1e6
-          $txRate = $dTx * 8 / $dt / 1e6
+      if (-not $info) {
+        Start-Frame
+        if ($Interface) {
+          Write-Host (Limit-Text "Interface '$Interface' not found (or no WLAN info). Check the name with: netsh wlan show interfaces" ($width * 2)) -ForegroundColor Yellow
+        } else {
+          Write-Host "No WLAN info found. Are you on Wi-Fi, and is the adapter enabled?" -ForegroundColor Yellow
         }
+        Stop-Frame
+        $lastRx = $null; $lastTx = $null; $lastSampleSec = $null
       }
-      $lastRx        = $info.RxBytes
-      $lastTx        = $info.TxBytes
-      $lastSampleSec = $sampleSec
+      else {
 
-      # Nearby networks: ask Windows for a fresh scan, then read the list a few seconds later
-      $t = $sw.Elapsed.TotalSeconds
+        $sigPct = if ($null -ne $info.SignalPct) { [int]$info.SignalPct } else { 0 }
 
-      if ($ScanInterval -gt 0 -and $Script:WlanScanAvailable -and $info.Guid -and -not $Script:LocationBlocked -and
-          ($null -eq $lastScanReqSec -or ($t - $lastScanReqSec) -ge $ScanInterval)) {
-        try {
-          $rc = [WlanScanner]::Scan([Guid]$info.Guid)
-          if ($rc -eq 0) { $scanStatus = '' } else { $scanStatus = "scan request failed (error $rc), showing cached list" }
-        } catch { $scanStatus = 'scan request failed, showing cached list' }
-        $lastScanReqSec = $t
-        $pendingRead    = $true
-      }
-
-      $needRead = ($null -eq $lastReadSec) -or
-                  ($pendingRead -and ($t - $lastScanReqSec) -ge $scanWaitSec) -or
-                  (-not $pendingRead -and $ScanInterval -eq 0 -and ($t - $lastReadSec) -ge 5)
-
-      if ($needRead -and -not $Script:LocationBlocked) {
-        try { $nets = @(Get-NearbyNetworks) } catch { $nets = @() }
-        $lastReadSec = $sw.Elapsed.TotalSeconds
-        $pendingRead = $false
-      }
-
-      # ---- All data collected; now draw the whole screen in one go ----
-      $barWidth = [Math]::Max(10, [Math]::Min(30, $width - 34))
-      $sigBar   = New-SignalBar -Percent $sigPct -Width $barWidth
-      $sigText  = "{0,3}%" -f $sigPct
-      $sigLine  = if ($null -eq $info.SignalPct -and $null -eq $info.Rssi) { '-' }
-                  else { Format-SignalColor -Percent $sigPct -Text "$sigText  $sigBar  ($rssiText)" }
-
-      $line = "".PadRight([Math]::Min(80, $width), '-')
-
-      Clear-Host
-
-      # ===== HEADER: scales to the console width =====
-      $timePart     = "{0:yyyy-MM-dd HH:mm:ss}" -f $now
-      $adapterName  = ($info.Name        ?? '(unknown)')
-      $adapterDesc  = ($info.Description ?? '')
-
-      $headerPrefix = "Wi-Fi Monitor v$WifiMonitorVersion |  $timePart  |  Adapter: "
-      if ($headerPrefix.Length + 8 -gt $width) {
-        # Narrow window: use a compact prefix
-        $headerPrefix = "v$WifiMonitorVersion | $timePart | "
-      }
-      $avail = [Math]::Max(0, $width - $headerPrefix.Length)
-
-      $nameShown = Limit-Text $adapterName $avail
-      $descShown = ''
-      $descAvail = $avail - $nameShown.Length - 3        # " (" + ")"
-      if (-not [string]::IsNullOrWhiteSpace($adapterDesc) -and $descAvail -ge 4) {
-        $descShown = Limit-Text $adapterDesc $descAvail
-      }
-
-      Write-Host $headerPrefix -ForegroundColor Green -NoNewline
-      if ($descShown) {
-        Write-Host $nameShown -ForegroundColor Yellow -NoNewline
-        Write-Host " ($descShown)" -ForegroundColor Yellow
-      } else {
-        Write-Host $nameShown -ForegroundColor Yellow
-      }
-
-      $headerLen = $headerPrefix.Length + $nameShown.Length + $(if ($descShown) { $descShown.Length + 3 } else { 0 })
-      Write-Host ("".PadRight([Math]::Min($headerLen, $width), '=')) -ForegroundColor DarkGray
-      "" | Out-Host
-
-      if ($Script:LocationBlocked) {
-        Write-Host (Limit-Text "!! LOCATION SERVICES ARE NOT ENABLED - fix your shit! !!" $width) -ForegroundColor Red
-        Write-Host (Limit-Text "  netsh can't return SSID, BSSID, signal or nearby networks without it." $width) -ForegroundColor Yellow
-        Write-Host (Limit-Text "  Enable: Settings > Privacy & security > Location  (ms-settings:privacy-location)" $width) -ForegroundColor Yellow
-        "" | Out-Host
-      }
-
-      # Connection section
-      Write-Host "[ Connection ]" -ForegroundColor Cyan
-      Write-Host $line
-
-      Write-Host ("{0,-12}: " -f 'State') -NoNewline
-      Write-Host ($info.State       ?? '-') -ForegroundColor White
-
-      Write-Host ("{0,-12}: " -f 'SSID') -NoNewline
-      Write-Host ($info.SSID        ?? '-') -ForegroundColor White
-
-      Write-Host ("{0,-12}: " -f 'BSSID') -NoNewline
-      Write-Host ($info.BSSID       ?? '-') -ForegroundColor White
-
-      Write-Host ("{0,-12}: " -f 'Channel') -NoNewline
-      Write-Host ($info.Channel     ?? '-') -ForegroundColor White
-
-      Write-Host ("{0,-12}: " -f 'Radio') -NoNewline
-      Write-Host ($info.RadioType   ?? '-') -ForegroundColor White
-
-      Write-Host ("{0,-12}: " -f 'Auth/Cipher') -NoNewline
-      $ac = if ($info.Auth -and $info.Cipher) { "$($info.Auth) / $($info.Cipher)" } else { '-' }
-      Write-Host $ac -ForegroundColor White
-
-      Write-Host ("{0,-12}: " -f 'IPv4') -NoNewline
-      Write-Host ($info.IPv4        ?? '-') -ForegroundColor White
-
-      Write-Host ("{0,-12}: " -f 'Gateway') -NoNewline
-      Write-Host ($info.Gateway     ?? '-') -ForegroundColor White
-
-      Write-Host ("{0,-12}: " -f 'Profile') -NoNewline
-      Write-Host ($info.Profile     ?? '-') -ForegroundColor White
-
-      Write-Host ("{0,-12}: " -f 'MAC') -NoNewline
-      Write-Host ($info.PhysicalAddress ?? '-') -ForegroundColor White
-
-      "" | Out-Host
-
-      # Link / Traffic section
-      Write-Host "[ Link / Traffic ]" -ForegroundColor Cyan
-      Write-Host $line
-
-      $rxText = if ($null -ne $info.ReceiveRateMbps)  { '{0:0.0}' -f $info.ReceiveRateMbps } else { '-' }
-      $txText = if ($null -ne $info.TransmitRateMbps) { '{0:0.0}' -f $info.TransmitRateMbps } else { '-' }
-
-      Write-Host ("{0,-12}: " -f 'Link rate') -NoNewline
-      Write-Host ("{0} Mbps (rx) | {1} Mbps (tx)" -f $rxText, $txText) -ForegroundColor White
-
-      Write-Host ("{0,-12}: " -f 'Signal') -NoNewline
-      Write-Host $sigLine
-
-      Write-Host ("{0,-12}: " -f 'Throughput') -NoNewline
-      if ($null -ne $rxRate -and $null -ne $txRate) {
-        Write-Host ("{0:N2} Mbit/s (down) | {1:N2} Mbit/s (up)" -f $rxRate, $txRate) -ForegroundColor White
-      } else {
-        Write-Host "(warming up … or unavailable)" -ForegroundColor Yellow
-      }
-
-      Write-Host ("{0,-12}: " -f 'Data total') -NoNewline
-      Write-Host ("{0} / {1}" -f (Format-Bytes $info.RxBytes), (Format-Bytes $info.TxBytes)) -ForegroundColor White
-
-      "" | Out-Host
-
-      # Nearby SSIDs (merged 2.4 / 5 / 6 GHz)
-      Write-Host "[ Nearby SSIDs ]" -ForegroundColor Cyan -NoNewline
-      if ($ScanInterval -gt 0 -and $null -ne $lastReadSec -and -not $Script:LocationBlocked) {
-        $age = [int]($sw.Elapsed.TotalSeconds - $lastReadSec)
-        Write-Host (Limit-Text ("  (updated {0}s ago)" -f $age) ($width - 16)) -ForegroundColor DarkGray -NoNewline
-      }
-      Write-Host ""
-      if ($scanStatus) { Write-Host (Limit-Text "  $scanStatus" $width) -ForegroundColor Yellow }
-      Write-Host $line
-
-      if ($Script:LocationBlocked) {
-        Write-Host "  (unavailable: location services are off)" -ForegroundColor Yellow
-      } elseif ($nets.Count -gt 0) {
-        foreach ($n in ($nets | Select-Object -First 6)) {
-          $sigVal     = if ($null -ne $n.OverallSignal) { $n.OverallSignal } else { 0 }
-          $coloredMax = Format-SignalColor -Percent $sigVal -Text ("{0,3}%" -f $sigVal)
-
-          $parts = @()
-          if ($n.Ch24) { $parts += ("2.4GHz ch {0}, {1}%" -f $n.Ch24, $n.Sig24) }
-          if ($n.Ch5)  { $parts += ("5GHz ch {0}, {1}%"   -f $n.Ch5,  $n.Sig5)  }
-          if ($n.Ch6)  { $parts += ("6GHz ch {0}, {1}%"   -f $n.Ch6,  $n.Sig6)  }
-          if ($parts.Count -eq 0) { $parts += "band unknown" }
-
-          $bandsText = [string]::Join("; ", $parts)
-          $mark      = if ($info.SSID -and $n.SSID -eq $info.SSID) { '*' } else { '-' }
-
-          # Visible suffix "  [100%]" is 8 characters; truncate the left part to fit the console
-          $left = Limit-Text ("  {0} {1} ({2})" -f $mark, $n.SSID, $bandsText) ($width - 8)
-          Write-Host ("{0}  [{1}]" -f $left, $coloredMax)
+        if ($null -ne $info.Rssi) {
+          $rssi     = $info.Rssi
+          $rssiText = "$rssi dBm"
+        } else {
+          $rssi     = [int]([math]::Round(($sigPct / 2) - 100))
+          $rssiText = "~$rssi dBm"
         }
-      } else {
-        Write-Host "  (none reported)" -ForegroundColor Yellow
+
+        # Throughput (Mbit/s, decimal: 1 Mbit = 1,000,000 bits)
+        $rxRate = $null; $txRate = $null
+        if ($null -ne $lastRx -and $null -ne $lastTx -and $null -ne $lastSampleSec -and
+            $null -ne $info.RxBytes -and $null -ne $info.TxBytes) {
+          $dt  = $sampleSec - $lastSampleSec
+          $dRx = $info.RxBytes - $lastRx
+          $dTx = $info.TxBytes - $lastTx
+          # A negative delta means the counters were reset (reconnect / adapter reset)
+          if ($dt -gt 0 -and $dRx -ge 0 -and $dTx -ge 0) {
+            $rxRate = $dRx * 8 / $dt / 1e6
+            $txRate = $dTx * 8 / $dt / 1e6
+          }
+        }
+        $lastRx        = $info.RxBytes
+        $lastTx        = $info.TxBytes
+        $lastSampleSec = $sampleSec
+
+        # Nearby networks: ask Windows for a fresh scan, then read the list a few seconds later
+        $t = $sw.Elapsed.TotalSeconds
+
+        if ($ScanInterval -gt 0 -and $Script:WlanScanAvailable -and $info.Guid -and -not $Script:LocationBlocked -and
+            ($null -eq $lastScanReqSec -or ($t - $lastScanReqSec) -ge $ScanInterval)) {
+          try {
+            $rc = [WlanScanner]::Scan([Guid]$info.Guid)
+            if ($rc -eq 0) { $scanStatus = '' } else { $scanStatus = "scan request failed (error $rc), showing cached list" }
+          } catch { $scanStatus = 'scan request failed, showing cached list' }
+          $lastScanReqSec = $t
+          $pendingRead    = $true
+        }
+
+        $needRead = ($null -eq $lastReadSec) -or
+                    ($pendingRead -and ($t - $lastScanReqSec) -ge $scanWaitSec) -or
+                    (-not $pendingRead -and $ScanInterval -eq 0 -and ($t - $lastReadSec) -ge 5)
+
+        if ($needRead -and -not $Script:LocationBlocked) {
+          try { $nets = @(Get-NearbyNetworks) } catch { $nets = @() }
+          $lastReadSec = $sw.Elapsed.TotalSeconds
+          $pendingRead = $false
+        }
+
+        # ---- All data collected; now draw the whole screen in one go ----
+        $barWidth = [Math]::Max(10, [Math]::Min(30, $width - 34))
+        $sigBar   = New-SignalBar -Percent $sigPct -Width $barWidth
+        $sigText  = "{0,3}%" -f $sigPct
+        $sigLine  = if ($null -eq $info.SignalPct -and $null -eq $info.Rssi) { '-' }
+                    else { Format-SignalColor -Percent $sigPct -Text "$sigText  $sigBar  ($rssiText)" }
+
+        $line = "".PadRight([Math]::Min(80, $width), '-')
+
+        Start-Frame
+
+        # ===== HEADER: scales to the console width =====
+        $timePart     = "{0:yyyy-MM-dd HH:mm:ss}" -f $now
+        $adapterName  = ($info.Name        ?? '(unknown)')
+        $adapterDesc  = ($info.Description ?? '')
+
+        $headerPrefix = "Wi-Fi Monitor v$WifiMonitorVersion |  $timePart  |  Adapter: "
+        if ($headerPrefix.Length + 8 -gt $width) {
+          # Narrow window: use a compact prefix
+          $headerPrefix = "v$WifiMonitorVersion | $timePart | "
+        }
+        $avail = [Math]::Max(0, $width - $headerPrefix.Length)
+
+        $nameShown = Limit-Text $adapterName $avail
+        $descShown = ''
+        $descAvail = $avail - $nameShown.Length - 3        # " (" + ")"
+        if (-not [string]::IsNullOrWhiteSpace($adapterDesc) -and $descAvail -ge 4) {
+          $descShown = Limit-Text $adapterDesc $descAvail
+        }
+
+        Write-Host $headerPrefix -ForegroundColor Green -NoNewline
+        if ($descShown) {
+          Write-Host $nameShown -ForegroundColor Yellow -NoNewline
+          Write-Host " ($descShown)" -ForegroundColor Yellow
+        } else {
+          Write-Host $nameShown -ForegroundColor Yellow
+        }
+
+        $headerLen = $headerPrefix.Length + $nameShown.Length + $(if ($descShown) { $descShown.Length + 3 } else { 0 })
+        Write-Host ("".PadRight([Math]::Min($headerLen, $width), '=')) -ForegroundColor DarkGray
+        Write-Host ''
+
+        if ($Script:LocationBlocked) {
+          Write-Host (Limit-Text "!! LOCATION SERVICES ARE NOT ENABLED - fix your shit! !!" $width) -ForegroundColor Red
+          Write-Host (Limit-Text "  netsh can't return SSID, BSSID, signal or nearby networks without it." $width) -ForegroundColor Yellow
+          Write-Host (Limit-Text "  Enable: Settings > Privacy & security > Location  (ms-settings:privacy-location)" $width) -ForegroundColor Yellow
+          Write-Host ''
+        }
+
+        # Connection section
+        Write-Host "[ Connection ]" -ForegroundColor Cyan
+        Write-Host $line
+
+        Write-Host ("{0,-12}: " -f 'State') -NoNewline
+        Write-Host ($info.State       ?? '-') -ForegroundColor White
+
+        Write-Host ("{0,-12}: " -f 'SSID') -NoNewline
+        Write-Host ($info.SSID        ?? '-') -ForegroundColor White
+
+        Write-Host ("{0,-12}: " -f 'BSSID') -NoNewline
+        Write-Host ($info.BSSID       ?? '-') -ForegroundColor White
+
+        Write-Host ("{0,-12}: " -f 'Channel') -NoNewline
+        Write-Host ($info.Channel     ?? '-') -ForegroundColor White
+
+        Write-Host ("{0,-12}: " -f 'Radio') -NoNewline
+        Write-Host ($info.RadioType   ?? '-') -ForegroundColor White
+
+        Write-Host ("{0,-12}: " -f 'Auth/Cipher') -NoNewline
+        $ac = if ($info.Auth -and $info.Cipher) { "$($info.Auth) / $($info.Cipher)" } else { '-' }
+        Write-Host $ac -ForegroundColor White
+
+        Write-Host ("{0,-12}: " -f 'IPv4') -NoNewline
+        Write-Host ($info.IPv4        ?? '-') -ForegroundColor White
+
+        Write-Host ("{0,-12}: " -f 'Gateway') -NoNewline
+        Write-Host ($info.Gateway     ?? '-') -ForegroundColor White
+
+        Write-Host ("{0,-12}: " -f 'Profile') -NoNewline
+        Write-Host ($info.Profile     ?? '-') -ForegroundColor White
+
+        Write-Host ("{0,-12}: " -f 'MAC') -NoNewline
+        Write-Host ($info.PhysicalAddress ?? '-') -ForegroundColor White
+
+        Write-Host ''
+
+        # Link / Traffic section
+        Write-Host "[ Link / Traffic ]" -ForegroundColor Cyan
+        Write-Host $line
+
+        $rxText = if ($null -ne $info.ReceiveRateMbps)  { '{0:0.0}' -f $info.ReceiveRateMbps } else { '-' }
+        $txText = if ($null -ne $info.TransmitRateMbps) { '{0:0.0}' -f $info.TransmitRateMbps } else { '-' }
+
+        Write-Host ("{0,-12}: " -f 'Link rate') -NoNewline
+        Write-Host ("{0} Mbps (rx) | {1} Mbps (tx)" -f $rxText, $txText) -ForegroundColor White
+
+        Write-Host ("{0,-12}: " -f 'Signal') -NoNewline
+        Write-Host $sigLine
+
+        Write-Host ("{0,-12}: " -f 'Throughput') -NoNewline
+        if ($null -ne $rxRate -and $null -ne $txRate) {
+          Write-Host ("{0:N2} Mbit/s (down) | {1:N2} Mbit/s (up)" -f $rxRate, $txRate) -ForegroundColor White
+        } else {
+          Write-Host "(warming up … or unavailable)" -ForegroundColor Yellow
+        }
+
+        Write-Host ("{0,-12}: " -f 'Data total') -NoNewline
+        Write-Host ("{0} / {1}" -f (Format-Bytes $info.RxBytes), (Format-Bytes $info.TxBytes)) -ForegroundColor White
+
+        Write-Host ''
+
+        # Nearby SSIDs (merged 2.4 / 5 / 6 GHz)
+        Write-Host "[ Nearby SSIDs ]" -ForegroundColor Cyan -NoNewline
+        if ($ScanInterval -gt 0 -and $null -ne $lastReadSec -and -not $Script:LocationBlocked) {
+          $age = [int]($sw.Elapsed.TotalSeconds - $lastReadSec)
+          Write-Host (Limit-Text ("  (updated {0}s ago)" -f $age) ($width - 16)) -ForegroundColor DarkGray -NoNewline
+        }
+        Write-Host ""
+        if ($scanStatus) { Write-Host (Limit-Text "  $scanStatus" $width) -ForegroundColor Yellow }
+        Write-Host $line
+
+        if ($Script:LocationBlocked) {
+          Write-Host "  (unavailable: location services are off)" -ForegroundColor Yellow
+        } elseif ($nets.Count -gt 0) {
+          foreach ($n in ($nets | Select-Object -First 6)) {
+            $sigVal     = if ($null -ne $n.OverallSignal) { $n.OverallSignal } else { 0 }
+            $coloredMax = Format-SignalColor -Percent $sigVal -Text ("{0,3}%" -f $sigVal)
+
+            $parts = @()
+            if ($n.Ch24) { $parts += ("2.4GHz ch {0}, {1}%" -f $n.Ch24, $n.Sig24) }
+            if ($n.Ch5)  { $parts += ("5GHz ch {0}, {1}%"   -f $n.Ch5,  $n.Sig5)  }
+            if ($n.Ch6)  { $parts += ("6GHz ch {0}, {1}%"   -f $n.Ch6,  $n.Sig6)  }
+            if ($parts.Count -eq 0) { $parts += "band unknown" }
+
+            $bandsText = [string]::Join("; ", $parts)
+            $mark      = if ($info.SSID -and $n.SSID -eq $info.SSID) { '*' } else { '-' }
+
+            # Visible suffix "  [100%]" is 8 characters; truncate the left part to fit the console
+            $left = Limit-Text ("  {0} {1} ({2})" -f $mark, $n.SSID, $bandsText) ($width - 8)
+            Write-Host ("{0}  [{1}]" -f $left, $coloredMax)
+          }
+        } else {
+          Write-Host "  (none reported)" -ForegroundColor Yellow
+        }
+
+        Write-Host ''
+        Write-Host ("Press Ctrl-C to exit. Refresh: {0}s" -f $Interval) -ForegroundColor Cyan
+        Stop-Frame
       }
 
-      "" | Out-Host
-      Write-Host ("Press Ctrl-C to exit. Refresh: {0}s" -f $Interval) -ForegroundColor Cyan
+      # Sleep (never past the Duration limit)
+      $sleepMs = $Interval * 1000
+      if ($Duration -gt 0) {
+        $remainingMs = ($Duration - $sw.Elapsed.TotalSeconds) * 1000
+        $sleepMs = [Math]::Min($sleepMs, [Math]::Max(100, $remainingMs))
+      }
+      Start-Sleep -Milliseconds ([int]$sleepMs)
     }
-
-    # Sleep (never past the Duration limit)
-    $sleepMs = $Interval * 1000
-    if ($Duration -gt 0) {
-      $remainingMs = ($Duration - $sw.Elapsed.TotalSeconds) * 1000
-      $sleepMs = [Math]::Min($sleepMs, [Math]::Max(100, $remainingMs))
+    catch {
+      Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red
+      Start-Sleep -Seconds $Interval
     }
-    Start-Sleep -Milliseconds ([int]$sleepMs)
   }
-  catch {
-    Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red
-    Start-Sleep -Seconds $Interval
-  }
+}
+finally {
+  try { [Console]::CursorVisible = $true } catch {}
 }

@@ -23,6 +23,12 @@
         0 = infinite (until Ctrl-C).
         Otherwise exits after ~Duration seconds.
 
+    -NoCellInfo
+        Skip the serving cell section (band, channel, PCI, cell ID, RSRP/RSRQ).
+        Cell info is read through the Windows MobileBroadbandCellsInfo API. It works
+        only if the modem driver supports it, and in PowerShell 7 the query is run in a
+        short-lived powershell.exe child process (WinRT is not available in pwsh).
+
   EXAMPLES
     .\mbn-monitor.ps1
     .\mbn-monitor.ps1 -Interval 2
@@ -32,6 +38,10 @@
   NOTES
     - Parsing relies on English `netsh mbn` output labels. On localized Windows
       versions most fields will come back empty.
+    - Serving cell info (EARFCN, PCI, cell ID, RSRP/RSRQ) comes from the Windows
+      MobileBroadbandCellsInfo API. SINR, bandwidth and carrier aggregation are not
+      exposed by it. The 5G NR part of an NSA connection is only shown if the driver reports it.
+    - RSRP/RSRQ colors follow the Teltonika signal strength recommendations.
 #>
 
 param(
@@ -41,7 +51,9 @@ param(
   [string]$Interface,
 
   [ValidateRange(0, [int]::MaxValue)]
-  [int]$Duration = 0
+  [int]$Duration = 0,
+
+  [switch]$NoCellInfo
 )
 
 # Version variable - change this in one place, it updates the banner automatically
@@ -59,6 +71,28 @@ $script:RegexIgnoreCaseMultiline = `
 
 # "Connected" must match exactly - a plain -match "connected" also matches "Disconnected"
 $script:ConnectedPattern = '^\s*connected\s*$'
+
+# Serving cell info (WinRT MobileBroadbandCellsInfo). Disabled automatically after 3 failed queries.
+$script:CellInfoEnabled  = -not $NoCellInfo
+$script:CellInfoFailures = 0
+$script:CellQueryCode = @'
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+$null = [Windows.Networking.NetworkOperators.MobileBroadbandModem,Windows.Networking.NetworkOperators,ContentType=WindowsRuntime]
+$null = [Windows.Networking.NetworkOperators.MobileBroadbandCellsInfo,Windows.Networking.NetworkOperators,ContentType=WindowsRuntime]
+$asTask = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+  $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and
+  $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' } | Select-Object -First 1
+$modem = [Windows.Networking.NetworkOperators.MobileBroadbandModem]::GetDefault()
+$op    = $modem.CurrentNetwork.GetCellsInfoAsync()
+$cells = $asTask.MakeGenericMethod([Windows.Networking.NetworkOperators.MobileBroadbandCellsInfo]).Invoke($null,@($op)).GetAwaiter().GetResult()
+@{
+  Lte = @($cells.ServingCellsLte | ForEach-Object { $_ | Select-Object * })
+  Nr  = @($cells.ServingCellsNR  | ForEach-Object { $_ | Select-Object * })
+} | ConvertTo-Json -Depth 4 -Compress
+'@
+$script:CellQueryEnc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script:CellQueryCode))
 
 # ====================================================================
 #                           PARSING HELPERS
@@ -150,6 +184,9 @@ function Get-MbnInterfaceList {
       Dns6          = $null
       RxBytes       = $null
       TxBytes       = $null
+
+      # serving cell info (see Get-MbnCellInfo)
+      CellInfo      = $null
     }
   }
 
@@ -225,13 +262,6 @@ function New-SignalBar {
   ("=" * $filled) + (" " * $empty)
 }
 
-function Get-SignalColor {
-  param([int]$Percent)
-  if ($Percent -ge 67) { "Green" }
-  elseif ($Percent -ge 34) { "Yellow" }
-  else { "Red" }
-}
-
 function Get-RadioColor {
   param([string]$Class)
 
@@ -272,7 +302,146 @@ function Write-Field {
   )
   Write-Host ("{0,-18}: " -f $Label) -ForegroundColor DarkGray -NoNewline
   $text = if ($null -eq $Value) { '' } else { [string]$Value }
-  Write-Host (Limit-Text $text ($Width - 20)) -ForegroundColor $Color
+  Write-ColorText (Limit-Text $text ($Width - 20)) $Color
+  Write-Host ''
+}
+
+function Write-ColorText {
+  # Writes text without a newline. 'Orange' is not a console color: it is drawn with a
+  # 256-color ANSI escape in Windows Terminal, and falls back to DarkYellow elsewhere.
+  param([string]$Text, [string]$Color = 'White')
+  if ($Color -eq 'Orange') {
+    if ($env:WT_SESSION) {
+      $e = [char]27
+      Write-Host ("{0}[38;5;208m{1}{0}[0m" -f $e, $Text) -NoNewline
+    } else {
+      Write-Host $Text -ForegroundColor DarkYellow -NoNewline
+    }
+  } else {
+    Write-Host $Text -ForegroundColor $Color -NoNewline
+  }
+}
+
+function Write-BarField {
+  # "Label             : value    [=====     ]  (text)" line, bar and text colored with Color.
+  param(
+    [string]$Label,
+    [string]$ValueText,
+    [int]$Percent,
+    [string]$Color,
+    [string]$Suffix,
+    [int]$BarWidth,
+    [int]$Width = 80
+  )
+  Write-Host ("{0,-18}: " -f $Label) -ForegroundColor DarkGray -NoNewline
+  Write-ColorText ("{0,-9}" -f $ValueText) $Color
+  Write-Host "[" -ForegroundColor White -NoNewline
+  Write-ColorText (New-SignalBar -Percent $Percent -Width $BarWidth) $Color
+  Write-Host "]" -ForegroundColor White -NoNewline
+  # the level text is dropped / shortened when the console is too narrow
+  Write-ColorText (Limit-Text $Suffix ($Width - (20 + 9 + 2 + $BarWidth))) $Color
+  Write-Host ''
+}
+
+# Maps a value onto 0-100 % for the bar: Low -> 0 %, High -> 100 %
+function ConvertTo-BarPercent {
+  param([double]$Value, [double]$Low, [double]$High)
+  $pct = ($Value - $Low) / ($High - $Low) * 100
+  return [int][Math]::Max(0, [Math]::Min(100, [Math]::Round($pct)))
+}
+
+# ====================================================================
+#                         CELL INFO HELPERS
+# ====================================================================
+
+# LTE EARFCN (downlink) -> band + downlink frequency.
+# F_DL = F_low + 0.1 * (N_DL - N_start). Common bands only.
+function Get-LteBandInfo {
+  param([int]$Earfcn)
+
+  # Band, F_low (MHz), N_start, N_end
+  $bands = @(
+    @(1, 2110, 0, 599),        @(2, 1930, 600, 1199),     @(3, 1805, 1200, 1949),
+    @(4, 2110, 1950, 2399),    @(5, 869, 2400, 2649),     @(7, 2620, 2750, 3449),
+    @(8, 925, 3450, 3799),     @(12, 729, 5010, 5179),    @(13, 746, 5180, 5279),
+    @(14, 758, 5280, 5379),    @(17, 734, 5730, 5849),    @(18, 860, 5850, 5999),
+    @(19, 875, 6000, 6149),    @(20, 791, 6150, 6449),    @(21, 1495.9, 6450, 6599),
+    @(25, 1930, 8040, 8689),   @(26, 859, 8690, 9039),    @(28, 758, 9210, 9659),
+    @(29, 717, 9660, 9769),    @(30, 2350, 9770, 9869),   @(32, 1452, 9920, 10359),
+    @(38, 2570, 37750, 38249), @(39, 1880, 38250, 38649), @(40, 2300, 38650, 39649),
+    @(41, 2496, 39650, 41589), @(42, 3400, 41590, 43589), @(43, 3600, 43590, 45589),
+    @(46, 5150, 46790, 54539), @(66, 2110, 66436, 67335), @(71, 617, 68586, 68935)
+  )
+
+  foreach ($b in $bands) {
+    if ($Earfcn -ge $b[2] -and $Earfcn -le $b[3]) {
+      return [pscustomobject]@{ Band = $b[0]; DlMHz = ($b[1] + 0.1 * ($Earfcn - $b[2])) }
+    }
+  }
+  return $null
+}
+
+# NR-ARFCN -> frequency in MHz (global frequency raster)
+function Get-NrFreqMHz {
+  param([double]$Arfcn)
+  if ($Arfcn -lt 600000)       { return 0.005 * $Arfcn }
+  elseif ($Arfcn -lt 2016667)  { return 3000 + 0.015 * ($Arfcn - 600000) }
+  else                         { return 24250.08 + 0.06 * ($Arfcn - 2016667) }
+}
+
+# Teltonika "Mobile Signal Strength Recommendations" levels -> console color + text
+function Get-RsrpLevel {
+  param($Value)
+  if     ($Value -ge -80)  { return @('Green',      'excellent') }
+  elseif ($Value -ge -90)  { return @('Yellow',     'good') }
+  elseif ($Value -ge -100) { return @('Orange',     'fair to poor') }
+  else                     { return @('Red',        'poor') }
+}
+
+function Get-RsrqLevel {
+  param($Value)
+  if     ($Value -ge -10)  { return @('Green',      'excellent') }
+  elseif ($Value -ge -15)  { return @('Yellow',     'good') }
+  elseif ($Value -ge -20)  { return @('Orange',     'fair to poor') }
+  else                     { return @('Red',        'poor') }
+}
+
+function Get-SinrLevel {
+  param($Value)
+  if     ($Value -ge 20) { return @('Green',  'excellent') }
+  elseif ($Value -ge 13) { return @('Yellow', 'good') }
+  elseif ($Value -gt 0)  { return @('Orange', 'fair to poor') }
+  else                   { return @('Red',    'poor') }
+}
+
+# Reads the serving cell(s) through the Windows MobileBroadbandCellsInfo API.
+# Windows PowerShell: in-process. PowerShell 7: WinRT is unavailable, so a short-lived
+# powershell.exe child process does the query.
+function Get-MbnCellInfo {
+  if (-not $script:CellInfoEnabled) { return $null }
+
+  try {
+    if ($PSVersionTable.PSEdition -eq 'Core') {
+      $out  = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $script:CellQueryEnc 2>$null
+      if ($LASTEXITCODE -ne 0) { throw "cell query failed ($LASTEXITCODE)" }
+      $json = $out -join ''
+    } else {
+      $json = & ([scriptblock]::Create($script:CellQueryCode))
+    }
+
+    $data = $json | ConvertFrom-Json
+    $script:CellInfoFailures = 0
+
+    return [pscustomobject]@{
+      Lte = @($data.Lte) | Select-Object -First 1
+      Nr  = @($data.Nr)  | Select-Object -First 1
+    }
+  }
+  catch {
+    $script:CellInfoFailures++
+    if ($script:CellInfoFailures -ge 3) { $script:CellInfoEnabled = $false }
+    return $null
+  }
 }
 
 # ====================================================================
@@ -301,6 +470,11 @@ function Get-MbnInterfaceInfo {
   # so do it BEFORE reading the byte counters: the counters are then the last thing read
   # and the sample timestamp taken by the caller stays close to them.
   Update-MbnExtendedInfo -iface $chosen
+
+  # Serving cell info (band, channel, PCI, RSRP/RSRQ), only while connected
+  if ($chosen.State -match $script:ConnectedPattern) {
+    $chosen.CellInfo = Get-MbnCellInfo
+  }
 
   # IP configuration
   try {
@@ -413,13 +587,10 @@ function Show-MbnScreen {
     $rssiText = "~$rssi dBm"
   }
 
-  $sigText    = "{0,3}%" -f $sigPct
-  $sigColor   = Get-SignalColor $sigPct
   $radioColor = Get-RadioColor $info.CellularClass
 
-  # Signal line: 20 (label) + 5 (" 32% ") + 2 (brackets) + ~14 ("  (~-93 dBm)") = ~41 columns around the bar
-  $barWidth = [Math]::Max(8, [Math]::Min(25, $width - 44))
-  $barInner = New-SignalBar -Percent $sigPct -Width $barWidth
+  # Bar rows (Signal / RSRP / RSRQ): 20 (label) + 9 (value) + 2 (brackets) + ~21 ("  (35%, fair to poor)") around the bar
+  $barWidth = [Math]::Max(8, [Math]::Min(25, $width - 54))
 
   $line = "".PadRight([Math]::Min(80, $width), '-')
 
@@ -465,13 +636,10 @@ function Show-MbnScreen {
   Write-Field "Provider"     $info.Provider 'White'     $width
   Write-Field "Roaming"      $info.Roaming  'White'     $width
 
-  # Signal line
-  Write-Host ("{0,-18}: " -f "Signal")       -ForegroundColor DarkGray -NoNewline
-  Write-Host (" {0} " -f $sigText)           -ForegroundColor $sigColor -NoNewline
-  Write-Host "["                             -ForegroundColor White -NoNewline
-  Write-Host $barInner                       -ForegroundColor $sigColor -NoNewline
-  Write-Host "]"                             -ForegroundColor White -NoNewline
-  Write-Host ("  ({0})" -f $rssiText)        -ForegroundColor $sigColor
+  # Signal uses the same dBm scale and Teltonika levels as RSRP, so the rows agree with each other
+  # (the modem's own percentage is shown in the text, but no longer decides the color)
+  $sigLvl = Get-RsrpLevel $rssi
+  Write-BarField "Signal" $rssiText (ConvertTo-BarPercent -Value $rssi -Low -110 -High -70) $sigLvl[0] ("  ({0}%, {1})" -f $sigPct, $sigLvl[1]) $barWidth $width
 
   Write-Field "Device"       $info.DeviceType    'Gray'      $width
   Write-Field "Radio class"  $info.CellularClass $radioColor $width
@@ -514,6 +682,82 @@ function Show-MbnScreen {
   Write-Field "Mfr / FW" ("{0} / {1}" -f $info.Manufacturer, $info.Firmware) 'Gray' $width
 
   "" | Out-Host
+
+  # -------------------- SERVING CELL --------------------
+  $cell = $info.CellInfo
+  if ($cell -or $script:CellInfoEnabled) {
+    Write-Host "[ Serving cell ]" -ForegroundColor Cyan
+    Write-Host $line -ForegroundColor Gray
+
+    $lte = if ($cell) { $cell.Lte } else { $null }
+    $nr  = if ($cell) { $cell.Nr }  else { $null }
+
+    if ($lte) {
+      $earfcn   = $lte.ChannelNumber
+      $bandInfo = $null
+      if ($null -ne $earfcn) { $bandInfo = Get-LteBandInfo ([int]$earfcn) }
+
+      if ($bandInfo) {
+        Write-Field "LTE band" ("B{0}  ({1:F1} MHz DL)" -f $bandInfo.Band, $bandInfo.DlMHz) 'White' $width
+      }
+      Write-Field "EARFCN / PCI" ("{0} / {1}" -f $earfcn, $lte.PhysicalCellId) 'White' $width
+
+      if ($null -ne $lte.CellId) {
+        $cid = [long]$lte.CellId
+        Write-Field "Cell ID" ("{0}  (eNB {1}, cell {2})" -f $cid, ($cid -shr 8), ($cid -band 255)) 'White' $width
+      }
+
+      $prov = [string]$lte.ProviderId
+      $plmn = if ($prov.Length -ge 5) { "{0}-{1}" -f $prov.Substring(0,3), $prov.Substring(3) } else { '-' }
+      Write-Field "TAC / MCC-MNC" ("{0} / {1}" -f $lte.TrackingAreaCode, $plmn) 'White' $width
+
+      # Bars: RSRP -110..-70 dBm and RSRQ -25..-5 dB, so the four Teltonika levels fall on quarters
+      if ($null -ne $lte.ReferenceSignalReceivedPowerInDBm) {
+        $v   = $lte.ReferenceSignalReceivedPowerInDBm
+        $lvl = Get-RsrpLevel $v
+        Write-BarField "RSRP" ("{0} dBm" -f $v) (ConvertTo-BarPercent -Value $v -Low -110 -High -70) $lvl[0] ("  ({0})" -f $lvl[1]) $barWidth $width
+      }
+      if ($null -ne $lte.ReferenceSignalReceivedQualityInDBm) {
+        $v   = $lte.ReferenceSignalReceivedQualityInDBm
+        $lvl = Get-RsrqLevel $v
+        Write-BarField "RSRQ" ("{0} dB" -f $v) (ConvertTo-BarPercent -Value $v -Low -25 -High -5) $lvl[0] ("  ({0})" -f $lvl[1]) $barWidth $width
+      }
+    } else {
+      Write-Field "LTE" "not reported by the driver" 'Gray' $width
+    }
+
+    if ($nr) {
+      # NR property names are read defensively, since drivers differ in what they report
+      $nrProp = { param($n) $pp = $nr.PSObject.Properties[$n]; if ($pp) { $pp.Value } else { $null } }
+      $nrArfcn = & $nrProp 'ChannelNumber'
+      $nrPci   = & $nrProp 'PhysicalCellId'
+      $nrRsrp  = & $nrProp 'ReferenceSignalReceivedPowerInDBm'
+      $nrRsrq  = & $nrProp 'ReferenceSignalReceivedQualityInDBm'
+      $nrSinr  = & $nrProp 'SignalToNoiseRatioInDB'
+
+      if ($null -ne $nrArfcn) {
+        Write-Field "NR-ARFCN" ("{0}  ({1:F1} MHz)" -f $nrArfcn, (Get-NrFreqMHz $nrArfcn)) 'White' $width
+      }
+      if ($null -ne $nrPci) { Write-Field "NR PCI" $nrPci 'White' $width }
+      if ($null -ne $nrRsrp) {
+        $lvl = Get-RsrpLevel $nrRsrp
+        Write-BarField "NR RSRP" ("{0} dBm" -f $nrRsrp) (ConvertTo-BarPercent -Value $nrRsrp -Low -110 -High -70) $lvl[0] ("  ({0})" -f $lvl[1]) $barWidth $width
+      }
+      if ($null -ne $nrRsrq) {
+        $lvl = Get-RsrqLevel $nrRsrq
+        Write-BarField "NR RSRQ" ("{0} dB" -f $nrRsrq) (ConvertTo-BarPercent -Value $nrRsrq -Low -25 -High -5) $lvl[0] ("  ({0})" -f $lvl[1]) $barWidth $width
+      }
+      if ($null -ne $nrSinr) {
+        $lvl = Get-SinrLevel $nrSinr
+        Write-BarField "NR SINR" ("{0} dB" -f $nrSinr) (ConvertTo-BarPercent -Value $nrSinr -Low -5 -High 25) $lvl[0] ("  ({0})" -f $lvl[1]) $barWidth $width
+      }
+    }
+    elseif ($info.DataClass -match '5G') {
+      Write-Field "5G NR" "not reported by the driver" 'Gray' $width
+    }
+
+    "" | Out-Host
+  }
 
   # -------------------- LINK / TRAFFIC --------------------
   Write-Host "[ Link / Traffic ]" -ForegroundColor Cyan
