@@ -395,16 +395,17 @@ function Write-BarField {
       Write-ColorText (([string][char]0x2591) * ($BarWidth - $filled)) 'DarkGray'
     }
     'Braille' {
-      # braille: full cell U+28FF, half cell U+28C7, empty cell U+28C0 (thin baseline); half-cell resolution
+      # braille: full cell U+28FF, half cell U+2847 (left column only), empty part = spaces; half-cell resolution
+      # (same drawing as in wifi-monitor; the blank empty part keeps the suffix in a fixed column)
       $units = [int][Math]::Floor(($Percent * $BarWidth * 2) / 100.0)
       $units = [Math]::Max(0, [Math]::Min($BarWidth * 2, $units))
       $full  = [int][Math]::Floor($units / 2)
       $half  = $units % 2
       $empty = $BarWidth - $full - $half
       $filledText = ([string][char]0x28FF) * $full
-      if ($half -eq 1) { $filledText += [string][char]0x28C7 }
+      if ($half -eq 1) { $filledText += [string][char]0x2847 }
       Write-ColorText $filledText $Color
-      Write-ColorText (([string][char]0x28C0) * $empty) 'DarkGray'
+      Write-ColorText (' ' * $empty) 'DarkGray'
     }
     default {
       Write-Host "[" -ForegroundColor White -NoNewline
