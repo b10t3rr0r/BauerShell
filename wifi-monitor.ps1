@@ -16,6 +16,7 @@
   - Displays link rate (rx/tx) and a colored signal-strength bar with dBm estimate / RSSI
   - Tracks per-interval throughput (down/up Mbit/s) and total bytes transferred
   - Lists nearby SSIDs, merging 2.4 GHz, 5 GHz and 6 GHz information for each network
+  - Shows the channel width (20/40/80/160/320 MHz) the connected AP is operating on
   - Header, separators and lists scale to the current console width
   - Flicker-free: the screen is redrawn in place instead of cleared on every refresh
   - Requires no external modules or tools - only `netsh` and built-in cmdlets
@@ -72,6 +73,11 @@
       console host. Braille draws half-character steps and needs a font with braille glyphs;
       Block draws full block characters; Ascii forces plain ASCII.
 
+  -NearbyCount <int>
+      How many networks to list under "Nearby SSIDs" (1-50). Default: 6.
+      The connected network is always listed (first), then the strongest others.
+      Raise it only if the console window is tall enough for the whole display.
+
   Notes
   -----
   - The source file is plain ASCII (non-ASCII characters are built from [char] codes), so
@@ -83,11 +89,16 @@
     SSID, BSSID, channel, signal and the nearby-networks list are unavailable in that mode.
   - Parsing relies on English `netsh` output labels. On localized Windows versions
     most fields will come back empty.
-  - Nearby SSIDs list is limited to the top 6 networks, sorted by signal strength.
+  - Nearby SSIDs is a table with one column per band (channel and signal of the strongest BSSID),
+    plus the number of BSSIDs seen for the SSID. Sorted by strongest signal; the connected
+    network is listed first and the band the adapter is currently on is shaded.
   - Fresh scans are requested with the Windows WlanScan API (wlanapi.dll, via Add-Type).
     A scan takes a few seconds, so the list is read ~4 s after each request. Scanning very
     often can briefly disturb the connected adapter, so don't set -ScanInterval too low.
   - The currently connected SSID is marked with * in the nearby list.
+  - Channel width is not reported by netsh. It is decoded from the AP's beacon (HT/VHT/HE/EHT
+    operation elements) via the Windows WLAN API, so it is the width the AP operates on;
+    a client can end up using less. If it can't be read, only the channel number is shown.
   - In-place redraw needs a console window tall enough for the whole display (~35 rows).
     If it is too short, the script falls back to clearing the screen on every refresh.
 #>
@@ -105,7 +116,10 @@ param(
   [int]$ScanInterval = 10,       # seconds between active Wi-Fi scans (0 = off)
 
   [ValidateSet('Auto', 'Block', 'Braille', 'Ascii')]
-  [string]$BarStyle = 'Auto'
+  [string]$BarStyle = 'Auto',
+
+  [ValidateRange(1, 50)]
+  [int]$NearbyCount = 6          # number of networks in the nearby list
 )
 
 # Version variable - change this in one place, it updates the banner automatically
@@ -156,6 +170,137 @@ public static class WlanScanner {
 '@
   }
 } catch { $Script:WlanScanAvailable = $false; $Script:WlanScanError = $_.Exception.Message }
+
+# ---- Channel width of the connected AP (from the beacon information elements) ----
+# netsh does not report channel width, so it is read from the AP's HT/VHT/HE/EHT operation
+# elements via WlanGetNetworkBssList. Kept in its own class so a failure here never affects scanning.
+$Script:WlanWidthAvailable = $true
+try {
+  if (-not ([System.Management.Automation.PSTypeName]'WlanChannelWidth').Type) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class WlanChannelWidth {
+  [DllImport("wlanapi.dll")] static extern int WlanOpenHandle(uint dwClientVersion, IntPtr pReserved, out uint pdwNegotiatedVersion, out IntPtr phClientHandle);
+  [DllImport("wlanapi.dll")] static extern int WlanCloseHandle(IntPtr hClientHandle, IntPtr pReserved);
+  [DllImport("wlanapi.dll")] static extern int WlanGetNetworkBssList(IntPtr hClientHandle, ref Guid pInterfaceGuid, IntPtr pDot11Ssid, int dot11BssType, [MarshalAs(UnmanagedType.Bool)] bool bSecurityEnabled, IntPtr pReserved, out IntPtr ppWlanBssList);
+  [DllImport("wlanapi.dll")] static extern void WlanFreeMemory(IntPtr pMemory);
+
+  // WLAN_BSS_LIST: DWORD dwTotalSize; DWORD dwNumberOfItems; WLAN_BSS_ENTRY[] (360 bytes each)
+  const int EntrySize   = 360;
+  const int OffBssid    = 40;    // DOT11_MAC_ADDRESS dot11Bssid
+  const int OffIeOffset = 352;   // ULONG ulIeOffset
+  const int OffIeSize   = 356;   // ULONG ulIeSize
+
+  static string Label(int mhz) { return mhz == 8080 ? "80+80 MHz" : mhz + " MHz"; }
+
+  // VHT-style channel width field (also used for the VHT info inside the HE operation element)
+  static int VhtWidth(int w, int c0, int c1) {
+    if (w == 1) {
+      if (c1 == 0) return 80;
+      return Math.Abs(c1 - c0) == 8 ? 160 : 8080;
+    }
+    if (w == 2) return 160;
+    if (w == 3) return 8080;
+    return 0;   // 0 = 20/40 MHz, decided by the HT operation element
+  }
+
+  static byte[] ParseMac(string s) {
+    if (string.IsNullOrEmpty(s)) return null;
+    string[] parts = s.Trim().Split(new char[] { ':', '-' });
+    if (parts.Length != 6) return null;
+    byte[] r = new byte[6];
+    for (int i = 0; i < 6; i++) {
+      try { r[i] = Convert.ToByte(parts[i], 16); } catch { return null; }
+    }
+    return r;
+  }
+
+  static string Parse(byte[] b) {
+    int ht = 0, vht = 0, he6 = 0, eht = 0;
+    int p = 0;
+    while (p + 2 <= b.Length) {
+      int id = b[p], len = b[p + 1], d = p + 2;
+      if (d + len > b.Length) break;
+
+      if (id == 61 && len >= 2) {                      // HT Operation
+        int info = b[d + 1];
+        ht = ((info & 0x04) != 0 && (info & 0x03) != 0) ? 40 : 20;
+      }
+      else if (id == 192 && len >= 3) {                // VHT Operation
+        vht = VhtWidth(b[d], b[d + 1], b[d + 2]);
+      }
+      else if (id == 255 && len >= 1) {                // Element ID Extension
+        int ext = b[d];
+        if (ext == 36 && len >= 7) {                   // HE Operation
+          int prm = b[d + 1] | (b[d + 2] << 8) | (b[d + 3] << 16);
+          int q = d + 7;
+          if ((prm & (1 << 14)) != 0) {                // VHT Operation Information present
+            if (vht == 0 && q + 3 <= d + len) vht = VhtWidth(b[q], b[q + 1], b[q + 2]);
+            q += 3;
+          }
+          if ((prm & (1 << 15)) != 0) q += 1;          // Co-Hosted BSS present
+          if ((prm & (1 << 17)) != 0 && q + 5 <= d + len) {   // 6 GHz Operation Information present
+            int w6 = b[q + 1] & 0x03;
+            int c0 = b[q + 2], c1 = b[q + 3];
+            if (w6 == 0) he6 = 20;
+            else if (w6 == 1) he6 = 40;
+            else if (w6 == 2) he6 = 80;
+            else he6 = (c1 != 0 && Math.Abs(c1 - c0) > 8) ? 8080 : 160;
+          }
+        }
+        else if (ext == 106 && len >= 7) {             // EHT Operation (Wi-Fi 7)
+          if ((b[d + 1] & 0x01) != 0) {                // EHT Operation Information present
+            int we = b[d + 6] & 0x07;
+            if (we == 0) eht = 20;
+            else if (we == 1) eht = 40;
+            else if (we == 2) eht = 80;
+            else if (we == 3) eht = 160;
+            else if (we == 4) eht = 320;
+          }
+        }
+      }
+      p = d + len;
+    }
+    int res = eht != 0 ? eht : (he6 != 0 ? he6 : (vht != 0 ? vht : ht));
+    return res == 0 ? null : Label(res);
+  }
+
+  // Returns e.g. "80 MHz", or null if it could not be determined.
+  public static string Get(Guid ifGuid, string bssid) {
+    byte[] want = ParseMac(bssid);
+    if (want == null) return null;
+    uint ver; IntPtr h;
+    if (WlanOpenHandle(2, IntPtr.Zero, out ver, out h) != 0) return null;
+    IntPtr list = IntPtr.Zero;
+    try {
+      if (WlanGetNetworkBssList(h, ref ifGuid, IntPtr.Zero, 3, false, IntPtr.Zero, out list) != 0 || list == IntPtr.Zero) return null;
+      int count = Marshal.ReadInt32(list, 4);
+      for (int i = 0; i < count; i++) {
+        long entry = list.ToInt64() + 8 + (long)i * EntrySize;
+        bool match = true;
+        for (int k = 0; k < 6; k++) {
+          if (Marshal.ReadByte(new IntPtr(entry + OffBssid + k)) != want[k]) { match = false; break; }
+        }
+        if (!match) continue;
+        int ieOff = Marshal.ReadInt32(new IntPtr(entry + OffIeOffset));
+        int ieLen = Marshal.ReadInt32(new IntPtr(entry + OffIeSize));
+        if (ieLen <= 0 || ieLen > 65535) return null;
+        byte[] ies = new byte[ieLen];
+        Marshal.Copy(new IntPtr(entry + ieOff), ies, 0, ieLen);
+        return Parse(ies);
+      }
+      return null;
+    }
+    finally {
+      if (list != IntPtr.Zero) WlanFreeMemory(list);
+      WlanCloseHandle(h, IntPtr.Zero);
+    }
+  }
+}
+'@
+  }
+} catch { $Script:WlanWidthAvailable = $false }
 
 function Invoke-NetshWlanInterfaces { (netsh wlan show interfaces) -join [Environment]::NewLine }
 function Invoke-NetshWlanNetworks   { (netsh wlan show networks mode=bssid) -join [Environment]::NewLine }
@@ -234,6 +379,7 @@ function Get-WlanInterfaceList {
     $mac         = & $get "^\s*Physical\s*address\s*:\s*([0-9A-Fa-f:\-]+)"
     $rssi        = & $get "^\s*Rssi\s*:\s*(-?\d+)"
     $guid        = & $get "^\s*GUID\s*:\s*([0-9A-Fa-f\-]{36})"
+    $bandIf      = & $get "^\s*Band\s*:\s*(.+)$"
 
     # integer or decimal Mbps (e.g. 866 or 866.7)
     $rateMatches = [regex]::Matches($b, "^\s*.*?\(Mbps\)\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*$", $script:RegexOpts)
@@ -258,6 +404,7 @@ function Get-WlanInterfaceList {
       TransmitRateMbps= $txRate
       Rssi            = if ($rssi) { [int]$rssi } else { $null }
       Guid            = $guid
+      Band            = $bandIf
       __raw           = $b
     }
   }
@@ -468,6 +615,7 @@ function Get-NearbyNetworks {
 
     $agg += [pscustomobject]@{
       SSID          = $g.Name
+      Bssids        = $rows.Count
       OverallSignal = $overall.Signal
       Ch24          = if ($best24) { $best24.Channel } else { $null }
       Sig24         = if ($best24) { $best24.Signal  } else { $null }
@@ -619,6 +767,14 @@ try {
           $rssiText = "~$rssi dBm"
         }
 
+        # Channel width of the connected AP (null when unknown / unavailable)
+        $chanWidth = $null
+        if ($Script:WlanWidthAvailable -and $info.Guid -and $info.BSSID -and -not $Script:LocationBlocked) {
+          try { $chanWidth = [WlanChannelWidth]::Get([Guid]$info.Guid, [string]$info.BSSID) } catch { $chanWidth = $null }
+        }
+        $chanText = Nz $info.Channel '-'
+        if ($chanWidth -and $info.Channel) { $chanText = "$($info.Channel) ($chanWidth)" }
+
         # Throughput (Mbit/s, decimal: 1 Mbit = 1,000,000 bits)
         $rxRate = $null; $txRate = $null
         if ($null -ne $lastRx -and $null -ne $lastTx -and $null -ne $lastSampleSec -and
@@ -726,7 +882,7 @@ try {
         Write-Host (Nz $info.BSSID '-') -ForegroundColor White
 
         Write-Host ("{0,-12}: " -f 'Channel') -NoNewline
-        Write-Host (Nz $info.Channel '-') -ForegroundColor White
+        Write-Host $chanText -ForegroundColor White
 
         Write-Host ("{0,-12}: " -f 'Radio') -NoNewline
         Write-Host (Nz $info.RadioType '-') -ForegroundColor White
@@ -781,9 +937,13 @@ try {
 
         # Nearby SSIDs (merged 2.4 / 5 / 6 GHz)
         Write-Host "[ Nearby SSIDs ]" -ForegroundColor Cyan -NoNewline
+        $hdrParts = @()
         if ($ScanInterval -gt 0 -and $null -ne $lastReadSec -and -not $Script:LocationBlocked) {
-          $age = [int]($sw.Elapsed.TotalSeconds - $lastReadSec)
-          Write-Host (Limit-Text ("  (updated {0}s ago)" -f $age) ($width - 16)) -ForegroundColor DarkGray -NoNewline
+          $hdrParts += ("updated {0}s ago" -f [int]($sw.Elapsed.TotalSeconds - $lastReadSec))
+        }
+        if (-not $Script:LocationBlocked -and $nets.Count -gt 0) { $hdrParts += "* = connected, shaded = band in use" }
+        if ($hdrParts.Count -gt 0) {
+          Write-Host (Limit-Text ("  (" + ($hdrParts -join '; ') + ")") ($width - 16)) -ForegroundColor DarkGray -NoNewline
         }
         Write-Host ""
         if ($scanStatus) { Write-Host (Limit-Text "  $scanStatus" $width) -ForegroundColor Yellow }
@@ -792,24 +952,59 @@ try {
         if ($Script:LocationBlocked) {
           Write-Host "  (unavailable: location services are off)" -ForegroundColor Yellow
         } elseif ($nets.Count -gt 0) {
-          foreach ($n in ($nets | Select-Object -First 6)) {
-            $sigVal     = if ($null -ne $n.OverallSignal) { $n.OverallSignal } else { 0 }
-            $sigClr     = Get-SignalColor -Percent $sigVal
+          # Connected network first, then the strongest others; the connected one is always included
+          $connRows  = @($nets | Where-Object { $info.SSID -and $_.SSID -eq $info.SSID })
+          $otherRows = @($nets | Where-Object { -not ($info.SSID -and $_.SSID -eq $info.SSID) })
+          $shown     = @($connRows) + @($otherRows | Select-Object -First ([Math]::Max(0, $NearbyCount - $connRows.Count)))
 
-            $parts = @()
-            if ($n.Ch24) { $parts += ("2.4GHz ch {0}, {1}%" -f $n.Ch24, $n.Sig24) }
-            if ($n.Ch5)  { $parts += ("5GHz ch {0}, {1}%"   -f $n.Ch5,  $n.Sig5)  }
-            if ($n.Ch6)  { $parts += ("6GHz ch {0}, {1}%"   -f $n.Ch6,  $n.Sig6)  }
-            if ($parts.Count -eq 0) { $parts += "band unknown" }
+          # Band the adapter is on right now (shaded cell)
+          $connBand = $null
+          if     ($info.Band -like '2.4*') { $connBand = '2.4' }
+          elseif ($info.Band -like '5*')   { $connBand = '5' }
+          elseif ($info.Band -like '6*')   { $connBand = '6' }
+          elseif ($info.Channel)           { $connBand = if ([int]$info.Channel -le 14) { '2.4' } else { '5' } }
 
-            $bandsText = [string]::Join("; ", $parts)
-            $mark      = if ($info.SSID -and $n.SSID -eq $info.SSID) { '*' } else { '-' }
+          # Only show band columns that have data
+          $cols = @()
+          if ($shown | Where-Object { $_.Ch24 }) { $cols += [pscustomobject]@{ Key = '24'; Band = '2.4'; Title = '2.4 GHz' } }
+          if ($shown | Where-Object { $_.Ch5  }) { $cols += [pscustomobject]@{ Key = '5';  Band = '5';   Title = '5 GHz'   } }
+          if ($shown | Where-Object { $_.Ch6  }) { $cols += [pscustomobject]@{ Key = '6';  Band = '6';   Title = '6 GHz'   } }
 
-            # Visible suffix "  [100%]" is 8 characters; truncate the left part to fit the console
-            $left = Limit-Text ("  {0} {1} ({2})" -f $mark, $n.SSID, $bandsText) ($width - 8)
-            Write-Host ($left + "  [") -NoNewline
-            Write-Host ("{0,3}%" -f $sigVal) -ForegroundColor $sigClr -NoNewline
-            Write-Host "]"
+          # Column widths: "  * " (4) + SSID + 12 per band ("  " + 10) + "  BSS" (5)
+          $maxSsid = 4
+          foreach ($n in $shown) { if ($n.SSID.Length -gt $maxSsid) { $maxSsid = $n.SSID.Length } }
+          $fixedW = 4 + ($cols.Count * 12) + 5
+          $ssidW  = [Math]::Max(6, [Math]::Min($maxSsid, $width - $fixedW))
+
+          Write-Host ('    ' + 'SSID'.PadRight($ssidW)) -ForegroundColor DarkGray -NoNewline
+          foreach ($c in $cols) { Write-Host ('  ' + $c.Title.PadRight(10)) -ForegroundColor DarkGray -NoNewline }
+          Write-Host '  BSS' -ForegroundColor DarkGray
+
+          foreach ($n in $shown) {
+            $isConn  = [bool]($info.SSID -and $n.SSID -eq $info.SSID)
+            $mark    = if ($isConn) { '*' } else { '-' }
+            $nameClr = if ($isConn) { 'White' } else { 'Gray' }
+
+            Write-Host ("  {0} {1}" -f $mark, (Limit-Text $n.SSID $ssidW).PadRight($ssidW)) -ForegroundColor $nameClr -NoNewline
+
+            foreach ($c in $cols) {
+              $ch  = $n.("Ch"  + $c.Key)
+              $sig = $n.("Sig" + $c.Key)
+              Write-Host '  ' -NoNewline
+              if ($ch) {
+                $cell = "ch{0,3} {1,3}%" -f $ch, $sig
+                $clr  = Get-SignalColor -Percent $sig
+                if ($isConn -and $c.Band -eq $connBand) {
+                  Write-Host $cell -ForegroundColor $clr -BackgroundColor DarkGray -NoNewline
+                } else {
+                  Write-Host $cell -ForegroundColor $clr -NoNewline
+                }
+              } else {
+                Write-Host ('-'.PadRight(10)) -ForegroundColor DarkGray -NoNewline
+              }
+            }
+
+            Write-Host ("  {0,3}" -f $n.Bssids) -ForegroundColor DarkGray
           }
         } else {
           Write-Host "  (none reported)" -ForegroundColor Yellow
