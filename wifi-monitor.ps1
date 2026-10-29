@@ -17,6 +17,7 @@
   - Tracks per-interval throughput (down/up Mbit/s) and total bytes transferred
   - Lists nearby SSIDs, merging 2.4 GHz, 5 GHz and 6 GHz information for each network
   - Shows the channel width (20/40/80/160/320 MHz) the connected AP is operating on
+  - Shows the AP vendor (Meraki, MikroTik, Ubiquiti, ...) from the BSSID, for the connected AP and nearby SSIDs
   - Header, separators and lists scale to the current console width
   - Flicker-free: the screen is redrawn in place instead of cleared on every refresh
   - Requires no external modules or tools - only `netsh` and built-in cmdlets
@@ -78,8 +79,26 @@
       The connected network is always listed (first), then the strongest others.
       Raise it only if the console window is tall enough for the whole display.
 
+  -OuiFile <path>
+      IEEE OUI database (oui.csv) used to show the vendor of access points, e.g. Meraki, MikroTik,
+      Ubiquiti, Aruba. Default: %LOCALAPPDATA%\wifi-monitor\oui.csv. If that file does not exist,
+      a oui.csv next to the script is tried. Without a database no vendors are shown.
+
+  -UpdateOui
+      Downloads the current IEEE OUI database (MA-L, ~4 MB, https://standards-oui.ieee.org/oui/oui.csv)
+      to -OuiFile before starting. Needs internet access; run it once, then now and then to refresh.
+
+      Examples:
+        .\wifi-monitor.ps1 -UpdateOui
+            Download the vendor database, then start monitoring.
+
   Notes
   -----
+  - Vendors come from the first three bytes of the BSSID (OUI lookup, like Wi-Fi analyzer apps do).
+    Many APs derive extra BSSIDs by setting the "locally administered" bit; the lookup retries
+    with that bit cleared. Only the large MA-L registry is used, so vendors with small
+    MA-M/MA-S blocks are not recognized. The vendor is the hardware maker in the MAC, not
+    necessarily the brand on the box (OEM/white-label devices show the OEM).
   - The source file is plain ASCII (non-ASCII characters are built from [char] codes), so
     Windows PowerShell 5.1 reads it correctly even though the file has no BOM.
   - Newer Windows versions only let `netsh wlan show interfaces` / `netsh wlan show networks`
@@ -119,7 +138,11 @@ param(
   [string]$BarStyle = 'Auto',
 
   [ValidateRange(1, 50)]
-  [int]$NearbyCount = 6          # number of networks in the nearby list
+  [int]$NearbyCount = 6,         # number of networks in the nearby list
+
+  [string]$OuiFile = (Join-Path $(if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { $env:TEMP }) 'wifi-monitor\oui.csv'),
+
+  [switch]$UpdateOui             # download the IEEE OUI database to $OuiFile before starting
 )
 
 # Version variable - change this in one place, it updates the banner automatically
@@ -546,6 +569,7 @@ function Get-NearbyNetworks {
   $entries = @()
 
   $currentSsid   = $null
+  $currentBssid  = $null
   $pendingSignal = $null
   $pendingBand   = $null   # "2.4", "5" or "6"
 
@@ -555,6 +579,15 @@ function Get-NearbyNetworks {
     $mSsid = [regex]::Match($ln, "^\s*SSID\s+\d+\s*:\s*(.*?)\s*$")
     if ($mSsid.Success) {
       $currentSsid   = $mSsid.Groups[1].Value.Trim()
+      $pendingSignal = $null
+      $pendingBand   = $null
+      continue
+    }
+
+    # New BSSID line inside an SSID block ("BSSID 1 : aa:bb:cc:dd:ee:ff")
+    $mBss = [regex]::Match($ln, "^\s*BSSID\s+\d+\s*:\s*([0-9A-Fa-f:\-]{17})")
+    if ($mBss.Success) {
+      $currentBssid  = $mBss.Groups[1].Value
       $pendingSignal = $null
       $pendingBand   = $null
       continue
@@ -592,6 +625,7 @@ function Get-NearbyNetworks {
           Signal  = $pendingSignal
           Channel = $chan
           BandGHz = $band
+          BSSID   = $currentBssid
         }
         $pendingSignal = $null
         $pendingBand   = $null
@@ -613,8 +647,18 @@ function Get-NearbyNetworks {
     $best6  = $rows | Where-Object { $_.BandGHz -eq '6'   } | Sort-Object Signal -Descending | Select-Object -First 1
     $overall= $rows | Sort-Object Signal -Descending | Select-Object -First 1
 
+    # Vendor(s) of the BSSIDs of this SSID: most common first, "+n" if more than one vendor
+    $vendorText = ''
+    if ($Script:Oui) {
+      $vn = @($rows | ForEach-Object { Get-MacVendor $_.BSSID } | Where-Object { $_ } |
+              Group-Object | Sort-Object Count -Descending | ForEach-Object { $_.Name })
+      if ($vn.Count -ge 1) { $vendorText = $vn[0] }
+      if ($vn.Count -gt 1) { $vendorText += " +" + ($vn.Count - 1) }
+    }
+
     $agg += [pscustomobject]@{
       SSID          = $g.Name
+      Vendor        = $vendorText
       Bssids        = $rows.Count
       OverallSignal = $overall.Signal
       Ch24          = if ($best24) { $best24.Channel } else { $null }
@@ -712,6 +756,69 @@ function Stop-Frame {
   $Script:PrevLineCount = $Script:LineCount
 }
 
+# ---- AP vendor lookup (IEEE OUI database) ----------------------------------
+
+$Script:Oui = $null                 # hashtable: "AABBCC" -> organization name
+$Script:VendorCache = @{}
+
+function Format-VendorName {
+  # Shorten IEEE organization names for display and map well-known brands.
+  param([string]$Name)
+  $n = "$Name".Trim()
+  if ($n -match '(?i)routerboard|mikrotik') { return 'MikroTik' }
+  if ($n -match '(?i)meraki')               { return 'Meraki' }
+  if ($n -match '(?i)ubiquiti')             { return 'Ubiquiti' }
+  if ($n -match '(?i)^aruba')               { return 'Aruba' }
+  $prev = ''
+  while ($n -ne $prev) {
+    $prev = $n
+    $n = ($n -replace '(?i)[,\s]+(Inc|Incorporated|Ltd|Limited|LLC|Corp|Corporation|Co|Company|GmbH|AG|AB|BV|B\.V|S\.A|SA|Oy|A/S)\.?\s*$', '').Trim().TrimEnd(',', '.')
+  }
+  return $n
+}
+
+function Get-MacVendor {
+  param([string]$Mac)
+  if (-not $Script:Oui -or -not $Mac) { return $null }
+  $hex = ($Mac -replace '[^0-9A-Fa-f]', '').ToUpper()
+  if ($hex.Length -lt 6) { return $null }
+  $key = $hex.Substring(0, 6)
+  if ($Script:VendorCache.ContainsKey($key)) { return $Script:VendorCache[$key] }
+
+  $name = $Script:Oui[$key]
+  if (-not $name) {
+    # Locally administered bit set (virtual BSSIDs)? Retry with the bit cleared.
+    $b0 = [Convert]::ToInt32($key.Substring(0, 2), 16)
+    if (($b0 -band 2) -ne 0) {
+      $alt  = ('{0:X2}' -f ($b0 -bxor 2)) + $key.Substring(2, 4)
+      $name = $Script:Oui[$alt]
+    }
+  }
+  $res = $null
+  if ($name) { $res = Format-VendorName $name }
+  $Script:VendorCache[$key] = $res
+  return $res
+}
+
+function Update-OuiDatabase {
+  param([string]$Path)
+  $dir = Split-Path -Parent $Path
+  if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+  try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
+  Invoke-WebRequest -Uri 'https://standards-oui.ieee.org/oui/oui.csv' -OutFile $Path `
+    -UserAgent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) wifi-monitor' -UseBasicParsing -ErrorAction Stop
+}
+
+function Import-OuiDatabase {
+  param([string]$Path)
+  $db = @{}
+  foreach ($r in (Import-Csv -LiteralPath $Path)) {
+    $k = "$($r.Assignment)".Trim().ToUpper()
+    if ($k.Length -eq 6 -and -not $db.ContainsKey($k)) { $db[$k] = $r.'Organization Name' }
+  }
+  return $db
+}
+
 # ---- Main loop -------------------------------------------------------------
 
 $sw = [Diagnostics.Stopwatch]::StartNew()
@@ -726,6 +833,20 @@ $lastScanReqSec  = $null   # when an active scan was last requested
 $pendingRead     = $false  # a requested scan is waiting to be read
 $scanWaitSec     = 4       # a scan needs a few seconds before netsh shows the new results
 $scanStatus      = ''
+
+if ($UpdateOui) {
+  Write-Host "Downloading IEEE OUI database to $OuiFile ..."
+  try { Update-OuiDatabase -Path $OuiFile; Write-Host "Done." -ForegroundColor Green }
+  catch { Write-Host "OUI download failed: $($_.Exception.Message)" -ForegroundColor Red }
+}
+
+$ouiPath = $null
+if (Test-Path -LiteralPath $OuiFile) { $ouiPath = $OuiFile }
+elseif ($PSScriptRoot -and (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'oui.csv'))) { $ouiPath = Join-Path $PSScriptRoot 'oui.csv' }
+if ($ouiPath) {
+  Write-Host "Loading OUI database ..."
+  try { $Script:Oui = Import-OuiDatabase -Path $ouiPath } catch { $Script:Oui = $null }
+}
 
 Write-Host "Starting Wi-Fi monitor v$WifiMonitorVersion. Press Ctrl-C to stop.`n"
 
@@ -879,7 +1000,13 @@ try {
         Write-Host (Nz $info.SSID '-') -ForegroundColor White
 
         Write-Host ("{0,-12}: " -f 'BSSID') -NoNewline
-        Write-Host (Nz $info.BSSID '-') -ForegroundColor White
+        $apVendor = Get-MacVendor $info.BSSID
+        if ($apVendor) {
+          Write-Host (Nz $info.BSSID '-') -ForegroundColor White -NoNewline
+          Write-Host " ($apVendor)" -ForegroundColor DarkGray
+        } else {
+          Write-Host (Nz $info.BSSID '-') -ForegroundColor White
+        }
 
         Write-Host ("{0,-12}: " -f 'Channel') -NoNewline
         Write-Host $chanText -ForegroundColor White
@@ -942,6 +1069,7 @@ try {
           $hdrParts += ("updated {0}s ago" -f [int]($sw.Elapsed.TotalSeconds - $lastReadSec))
         }
         if (-not $Script:LocationBlocked -and $nets.Count -gt 0) { $hdrParts += "* = connected, shaded = band in use" }
+        if (-not $Script:LocationBlocked -and $nets.Count -gt 0 -and -not $Script:Oui) { $hdrParts += "no vendor database: run with -UpdateOui" }
         if ($hdrParts.Count -gt 0) {
           Write-Host (Limit-Text ("  (" + ($hdrParts -join '; ') + ")") ($width - 16)) -ForegroundColor DarkGray -NoNewline
         }
@@ -970,14 +1098,20 @@ try {
           if ($shown | Where-Object { $_.Ch5  }) { $cols += [pscustomobject]@{ Key = '5';  Band = '5';   Title = '5 GHz'   } }
           if ($shown | Where-Object { $_.Ch6  }) { $cols += [pscustomobject]@{ Key = '6';  Band = '6';   Title = '6 GHz'   } }
 
-          # Column widths: "  * " (4) + SSID + 12 per band ("  " + 10) + "  BSS" (5)
+          # Vendor column only when there is a database and at least one vendor was recognized
+          $hasVendor = [bool]($shown | Where-Object { $_.Vendor })
+          $vendorW   = 14
+
+          # Column widths: "  * " (4) + SSID + 12 per band ("  " + 10) + vendor (2 + 14) + "  BSS" (5)
           $maxSsid = 4
           foreach ($n in $shown) { if ($n.SSID.Length -gt $maxSsid) { $maxSsid = $n.SSID.Length } }
           $fixedW = 4 + ($cols.Count * 12) + 5
+          if ($hasVendor) { $fixedW += 2 + $vendorW }
           $ssidW  = [Math]::Max(6, [Math]::Min($maxSsid, $width - $fixedW))
 
           Write-Host ('    ' + 'SSID'.PadRight($ssidW)) -ForegroundColor DarkGray -NoNewline
           foreach ($c in $cols) { Write-Host ('  ' + $c.Title.PadRight(10)) -ForegroundColor DarkGray -NoNewline }
+          if ($hasVendor) { Write-Host ('  ' + 'Vendor'.PadRight($vendorW)) -ForegroundColor DarkGray -NoNewline }
           Write-Host '  BSS' -ForegroundColor DarkGray
 
           foreach ($n in $shown) {
@@ -1004,6 +1138,9 @@ try {
               }
             }
 
+            if ($hasVendor) {
+              Write-Host ('  ' + (Limit-Text $n.Vendor $vendorW).PadRight($vendorW)) -ForegroundColor Gray -NoNewline
+            }
             Write-Host ("  {0,3}" -f $n.Bssids) -ForegroundColor DarkGray
           }
         } else {
